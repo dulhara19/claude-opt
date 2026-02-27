@@ -1,5 +1,5 @@
-import type { PipelineContext, DependencyGraph, DependencyEdge, TaskEntry, Metrics, KeywordIndex, AdjacencyEntry } from '../types/index.js';
-import { toInternal, logger } from '../utils/index.js';
+import type { PipelineContext, DependencyGraph, DependencyEdge, TaskEntry, Metrics, KeywordIndex, AdjacencyEntry, TaskHistory, Patterns, ProjectMap } from '../types/index.js';
+import { toInternal, logger, stem, TASK_ACTION_STOPWORDS } from '../utils/index.js';
 import {
   readTaskHistory, writeTaskHistory, readMetrics, writeMetrics,
   readKeywordIndex, writeKeywordIndex, readDependencyGraph, writeDependencyGraph,
@@ -9,10 +9,12 @@ import type { AccuracyMetrics, OutcomeCapture } from './types.js';
 import {
   MAX_CAPTURE_TIME_MS, UNOPTIMIZED_MULTIPLIER,
   LEARNER_EDGE_INITIAL_WEIGHT, LEARNER_EDGE_INCREMENT, LEARNER_EDGE_MAX_WEIGHT,
+  KEYWORD_PRUNE_INTERVAL,
+  MIN_MULTIPLIER_TASKS, MIN_MULTIPLIER, BASELINE_TASK_WINDOW,
 } from './types.js';
 import { detectPatterns } from './pattern-detector.js';
-import { runWeightCorrection } from './weight-correction.js';
-import { updateSignalAccuracy, updateLearnedWeights, updateDomainSignalAccuracy, updateDomainLearnedWeights } from './signal-weight-learner.js';
+import { runWeightCorrectionInPlace } from './weight-correction.js';
+import { updateSignalAccuracy, updateLearnedWeights, updateDomainSignalAccuracy, updateDomainLearnedWeights, trackMissedOpportunities } from './signal-weight-learner.js';
 import { updateLearnedThresholds } from './threshold-learner.js';
 import { updateModelPerformance } from './router-learner.js';
 
@@ -53,29 +55,21 @@ function incrementEdgeWeight(currentWeight: number): number {
   return Math.min(currentWeight + LEARNER_EDGE_INCREMENT, LEARNER_EDGE_MAX_WEIGHT);
 }
 
+// ─── In-Place Mutation Functions (L1) ────────────────────────
+
 /**
- * Update the dependency graph with co-occurrence edges discovered from actual file usage.
- * New edges get type "cooccurrence" with a lower initial weight than import edges.
- * Existing co-occurrence edges have their weight incremented.
- * Import edges are never modified.
+ * Update the dependency graph in-place with co-occurrence edges (L1).
+ * Mutates `graph` directly. Returns true if any changes were made.
  */
-export function updateDependencyGraph(projectRoot: string, actualFiles: string[]): void {
-  if (actualFiles.length < 2) return;
+export function applyDependencyGraphUpdate(graph: DependencyGraph, actualFiles: string[]): boolean {
+  if (actualFiles.length < 2) return false;
 
   const normalizedFiles = actualFiles.map(toInternal);
-  const readResult = readDependencyGraph(projectRoot);
-  if (!readResult.ok) {
-    logger.warn(MODULE, `Failed to read dependency graph: ${readResult.error}`);
-    return;
-  }
-
-  const graph: DependencyGraph = readResult.value;
 
   // Build a lookup of existing edges by pair key
   const edgeIndex = new Map<string, DependencyEdge>();
   for (const edge of graph.edges) {
     const key = filePairKey(edge.source, edge.target);
-    // Only index the first edge per pair (import takes precedence)
     if (!edgeIndex.has(key)) {
       edgeIndex.set(key, edge);
     }
@@ -83,7 +77,6 @@ export function updateDependencyGraph(projectRoot: string, actualFiles: string[]
 
   let changed = false;
 
-  // Check each pair of actual files
   for (let i = 0; i < normalizedFiles.length; i++) {
     for (let j = i + 1; j < normalizedFiles.length; j++) {
       const fileA = normalizedFiles[i];
@@ -93,7 +86,6 @@ export function updateDependencyGraph(projectRoot: string, actualFiles: string[]
       const existing = edgeIndex.get(key);
 
       if (!existing) {
-        // No edge exists — add a new co-occurrence edge
         const sorted = [fileA, fileB].sort();
         const newEdge: DependencyEdge = {
           source: sorted[0],
@@ -105,7 +97,6 @@ export function updateDependencyGraph(projectRoot: string, actualFiles: string[]
         graph.edges.push(newEdge);
         edgeIndex.set(key, newEdge);
 
-        // Update adjacency lists (bidirectional for co-occurrence)
         if (!graph.adjacency[sorted[0]]) {
           graph.adjacency[sorted[0]] = { imports: [], importedBy: [] };
         }
@@ -121,7 +112,6 @@ export function updateDependencyGraph(projectRoot: string, actualFiles: string[]
 
         changed = true;
       } else if (existing.type === 'cooccurrence' && existing.discoveredBy === 'learner') {
-        // Existing co-occurrence edge — increment weight
         const currentWeight = existing.weight ?? LEARNER_EDGE_INITIAL_WEIGHT;
         const newWeight = incrementEdgeWeight(currentWeight);
         if (newWeight !== currentWeight) {
@@ -129,12 +119,32 @@ export function updateDependencyGraph(projectRoot: string, actualFiles: string[]
           changed = true;
         }
       }
-      // Import edges are NOT modified
     }
   }
 
   if (changed) {
     graph.updatedAt = new Date().toISOString();
+  }
+
+  return changed;
+}
+
+/**
+ * Disk-based wrapper for updateDependencyGraph (backward compat).
+ */
+export function updateDependencyGraph(projectRoot: string, actualFiles: string[]): void {
+  if (actualFiles.length < 2) return;
+
+  const readResult = readDependencyGraph(projectRoot);
+  if (!readResult.ok) {
+    logger.warn(MODULE, `Failed to read dependency graph: ${readResult.error}`);
+    return;
+  }
+
+  const graph = readResult.value;
+  const changed = applyDependencyGraphUpdate(graph, actualFiles);
+
+  if (changed) {
     const writeResult = writeDependencyGraph(projectRoot, graph);
     if (!writeResult.ok) {
       logger.warn(MODULE, `Failed to write dependency graph: ${writeResult.error}`);
@@ -169,40 +179,36 @@ function updateRunningAverage(oldAvg: number, newValue: number, newCount: number
   return oldAvg + (newValue - oldAvg) / newCount;
 }
 
+/** Default empty metrics for initialization. */
+function createDefaultMetrics(): Metrics {
+  return {
+    schemaVersion: '1.0.0',
+    overall: {
+      totalTasks: 0,
+      totalSessions: 0,
+      avgPrecision: 0,
+      avgRecall: 0,
+      totalTokensConsumed: 0,
+      totalTokensSaved: 0,
+      savingsRate: 0,
+    },
+    perDomain: {},
+    windows: [],
+    predictionTrend: [],
+  };
+}
+
 /**
- * Update aggregated metrics in metrics.json.
+ * Update aggregated metrics in-place (L1).
+ * Mutates `metrics` directly without disk I/O.
  */
-export function updateMetrics(
-  projectRoot: string,
+export function applyMetricsUpdate(
+  metrics: Metrics,
   accuracy: AccuracyMetrics,
   domain: string,
   tokensConsumed: number,
   tokensSaved: number,
 ): void {
-  const readResult = readMetrics(projectRoot);
-  let metrics: Metrics;
-
-  if (readResult.ok) {
-    metrics = readResult.value;
-  } else {
-    // Initialize default metrics if read fails
-    metrics = {
-      schemaVersion: '1.0.0',
-      overall: {
-        totalTasks: 0,
-        totalSessions: 0,
-        avgPrecision: 0,
-        avgRecall: 0,
-        totalTokensConsumed: 0,
-        totalTokensSaved: 0,
-        savingsRate: 0,
-      },
-      perDomain: {},
-      windows: [],
-      predictionTrend: [],
-    };
-  }
-
   // Update overall
   const newCount = metrics.overall.totalTasks + 1;
   metrics.overall.avgPrecision = updateRunningAverage(metrics.overall.avgPrecision, accuracy.precision, newCount);
@@ -231,56 +237,66 @@ export function updateMetrics(
   domainEntry.totalTasks = domainNewCount;
   domainEntry.totalTokensConsumed += tokensConsumed;
   domainEntry.totalTokensSaved += tokensSaved;
+}
 
+/**
+ * Disk-based wrapper for updateMetrics (backward compat).
+ */
+export function updateMetrics(
+  projectRoot: string,
+  accuracy: AccuracyMetrics,
+  domain: string,
+  tokensConsumed: number,
+  tokensSaved: number,
+): void {
+  const readResult = readMetrics(projectRoot);
+  const metrics = readResult.ok ? readResult.value : createDefaultMetrics();
+  applyMetricsUpdate(metrics, accuracy, domain, tokensConsumed, tokensSaved);
   const writeResult = writeMetrics(projectRoot, metrics);
   if (!writeResult.ok) {
     logger.warn(MODULE, `Failed to write metrics: ${writeResult.error}`);
   }
 }
 
-/** Common/stop words to filter from keyword extraction. */
+/** Common/stop words to filter from keyword extraction (L6: enhanced with stemming). */
 const STOP_WORDS = new Set([
   'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
   'of', 'with', 'by', 'from', 'is', 'it', 'this', 'that', 'be', 'as',
   'are', 'was', 'were', 'been', 'have', 'has', 'had', 'do', 'does', 'did',
   'will', 'would', 'could', 'should', 'may', 'might', 'can', 'not', 'no',
   'i', 'me', 'my', 'we', 'our', 'you', 'your', 'he', 'she', 'they',
-  'add', 'fix', 'update', 'change', 'make', 'get', 'set', 'use', 'new',
 ]);
 
 /**
- * Extract keywords from task description text.
+ * Extract keywords from task description text (L6: shared stemming with predictor).
+ * Applies stemming and task-action stopword filtering for consistency
+ * with the predictor's keyword extraction.
  */
 export function extractKeywords(text: string): string[] {
-  return text
+  const words = text
     .toLowerCase()
     .split(/[\s,.:;!?()[\]{}"'`/\\]+/)
-    .filter((w) => w.length > 2 && !STOP_WORDS.has(w));
+    .filter((w) => w.length > 2 && !STOP_WORDS.has(w) && !TASK_ACTION_STOPWORDS.has(w));
+
+  // Apply stemming for consistency with predictor (L6)
+  const stemmed = new Set<string>();
+  for (const word of words) {
+    stemmed.add(stem(word));
+  }
+
+  return [...stemmed];
 }
 
 /**
- * Update keyword-index.json with new keyword-to-file mappings from discovered files.
+ * Update keyword index in-place (L1).
+ * Mutates `index` directly without disk I/O.
  */
-export function updateKeywordIndex(
-  projectRoot: string,
+export function applyKeywordIndexUpdate(
+  index: KeywordIndex,
   taskDescription: string,
   falseNegatives: string[],
 ): void {
   if (falseNegatives.length === 0) return;
-
-  const readResult = readKeywordIndex(projectRoot);
-  let index: KeywordIndex;
-
-  if (readResult.ok) {
-    index = readResult.value;
-  } else {
-    index = {
-      schemaVersion: '1.0.0',
-      updatedAt: new Date().toISOString(),
-      keywordToFiles: {},
-      fileToKeywords: {},
-    };
-  }
 
   const keywords = extractKeywords(taskDescription);
   if (keywords.length === 0) return;
@@ -289,7 +305,6 @@ export function updateKeywordIndex(
     const normalizedFile = toInternal(file);
 
     for (const keyword of keywords) {
-      // keyword → files mapping
       if (!index.keywordToFiles[keyword]) {
         index.keywordToFiles[keyword] = [];
       }
@@ -297,7 +312,6 @@ export function updateKeywordIndex(
         index.keywordToFiles[keyword].push(normalizedFile);
       }
 
-      // file → keywords mapping
       if (!index.fileToKeywords[normalizedFile]) {
         index.fileToKeywords[normalizedFile] = [];
       }
@@ -308,6 +322,28 @@ export function updateKeywordIndex(
   }
 
   index.updatedAt = new Date().toISOString();
+}
+
+/**
+ * Disk-based wrapper for updateKeywordIndex (backward compat).
+ */
+export function updateKeywordIndex(
+  projectRoot: string,
+  taskDescription: string,
+  falseNegatives: string[],
+): void {
+  if (falseNegatives.length === 0) return;
+
+  const readResult = readKeywordIndex(projectRoot);
+  const index: KeywordIndex = readResult.ok ? readResult.value : {
+    schemaVersion: '1.0.0',
+    updatedAt: new Date().toISOString(),
+    keywordToFiles: {},
+    fileToKeywords: {},
+  };
+
+  applyKeywordIndexUpdate(index, taskDescription, falseNegatives);
+
   const writeResult = writeKeywordIndex(projectRoot, index);
   if (!writeResult.ok) {
     logger.warn(MODULE, `Failed to write keyword index: ${writeResult.error}`);
@@ -315,13 +351,52 @@ export function updateKeywordIndex(
 }
 
 /**
- * Build an OutcomeCapture entry from pipeline context.
+ * Prune keyword index entries pointing to files that no longer exist in projectMap (L5).
+ * Mutates `index` in-place.
+ */
+export function pruneKeywordIndex(index: KeywordIndex, projectMap: ProjectMap): number {
+  let pruned = 0;
+  const validFiles = new Set(Object.keys(projectMap.files));
+
+  // Prune fileToKeywords entries for missing files
+  for (const filePath of Object.keys(index.fileToKeywords)) {
+    if (!validFiles.has(filePath)) {
+      delete index.fileToKeywords[filePath];
+      pruned++;
+    }
+  }
+
+  // Prune file references from keywordToFiles
+  for (const keyword of Object.keys(index.keywordToFiles)) {
+    const files = index.keywordToFiles[keyword];
+    const filtered = files.filter((f) => validFiles.has(f));
+    if (filtered.length === 0) {
+      delete index.keywordToFiles[keyword];
+    } else if (filtered.length < files.length) {
+      index.keywordToFiles[keyword] = filtered;
+    }
+  }
+
+  if (pruned > 0) {
+    index.updatedAt = new Date().toISOString();
+    logger.debug(MODULE, `Pruned ${pruned} stale file entries from keyword index`);
+  }
+
+  return pruned;
+}
+
+/**
+ * Build an OutcomeCapture entry from pipeline context (L2: domain, L3: scores).
  */
 function buildOutcomeCapture(ctx: PipelineContext, accuracy: AccuracyMetrics): OutcomeCapture {
-  const predictedFilePaths = ctx.prediction?.predictions.map((p) => toInternal(p.filePath)) ?? [];
+  const predictions = ctx.prediction?.predictions ?? [];
+  const predictedFilePaths = predictions.map((p) => toInternal(p.filePath));
+  const predictedScores = predictions.map((p) => p.score);
   const actualFiles = ctx.adapterResult?.filesUsed.map(toInternal) ?? [];
   const tokensConsumed = ctx.adapterResult?.tokenEstimate ?? 0;
-  const estimatedUnoptimized = Math.ceil(tokensConsumed * UNOPTIMIZED_MULTIPLIER);
+  // L4: Use empirical multiplier if learned, else static default
+  const multiplier = ctx.storeCache?.metrics?.empiricalMultiplier ?? UNOPTIMIZED_MULTIPLIER;
+  const estimatedUnoptimized = Math.ceil(tokensConsumed * multiplier);
 
   return {
     id: generateTaskId(),
@@ -331,12 +406,14 @@ function buildOutcomeCapture(ctx: PipelineContext, accuracy: AccuracyMetrics): O
       taskType: ctx.classification?.type ?? 'Unknown',
       complexity: ctx.classification?.complexity ?? 'Medium',
       confidence: ctx.classification?.confidence ?? 0,
+      domain: ctx.classification?.domain ?? 'general',
     },
     prediction: {
       predictedFiles: predictedFilePaths,
       actualFiles,
       precision: accuracy.precision,
       recall: accuracy.recall,
+      predictedScores,
     },
     routing: {
       model: ctx.routing?.model ?? 'sonnet',
@@ -348,11 +425,17 @@ function buildOutcomeCapture(ctx: PipelineContext, accuracy: AccuracyMetrics): O
       saved: Math.max(0, estimatedUnoptimized - tokensConsumed),
     },
     feedback: null,
+    // L22: sessionId is set after metrics are loaded (needs totalSessions)
   };
 }
 
 /**
- * Capture post-task outcome: compare predicted vs actual, update history, metrics, and keyword index.
+ * Capture post-task outcome (L1: single read/write cycle).
+ *
+ * Loads all 5 store files once, runs all learning sub-modules on in-memory objects,
+ * then writes each file once. Eliminates redundant disk I/O from the original
+ * implementation (was: up to 13 reads, 5 writes → now: 5 reads, 5 writes).
+ *
  * Wrapped with fail-open — errors are logged but never block the user.
  */
 export function captureOutcome(ctx: PipelineContext): void {
@@ -368,43 +451,77 @@ export function captureOutcome(ctx: PipelineContext): void {
     // Compare accuracy
     const accuracy = compareAccuracy(predictedFiles, actualFiles);
 
-    // Build task history entry
+    // Build task history entry (L2: includes domain, L3: includes scores)
     const entry = buildOutcomeCapture(ctx, accuracy);
 
-    // Append to task history
+    // ─── L1: Load all stores once ───────────────────────────
     const historyResult = readTaskHistory(projectRoot);
-    if (historyResult.ok) {
-      const history = historyResult.value;
+    const metricsResult = readMetrics(projectRoot);
+    const keywordResult = readKeywordIndex(projectRoot);
+    const graphResult = readDependencyGraph(projectRoot);
+    const patternsResult = readPatterns(projectRoot);
+
+    const history: TaskHistory | null = historyResult.ok ? historyResult.value : null;
+    const metrics: Metrics = metricsResult.ok ? metricsResult.value : createDefaultMetrics();
+    const keywordIndex: KeywordIndex = keywordResult.ok ? keywordResult.value : {
+      schemaVersion: '1.0.0', updatedAt: new Date().toISOString(),
+      keywordToFiles: {}, fileToKeywords: {},
+    };
+    const graph: DependencyGraph | null = graphResult.ok ? graphResult.value : null;
+    const patterns: Patterns | null = patternsResult.ok ? patternsResult.value : null;
+
+    // L22: Set sessionId from metrics (now that metrics are loaded)
+    entry.sessionId = metrics.overall.totalSessions;
+
+    // Track what changed for selective writes
+    let historyChanged = false;
+    let metricsChanged = false;
+    let keywordIndexChanged = false;
+    let graphChanged = false;
+    let patternsChanged = false;
+
+    // ─── Step 1: Append to task history ─────────────────────
+    if (history) {
       history.tasks.push(entry as TaskEntry);
       history.count = history.tasks.length;
-      const writeResult = writeTaskHistory(projectRoot, history);
-      if (!writeResult.ok) {
-        logger.warn(MODULE, `Failed to write task history: ${writeResult.error}`);
-      }
+      historyChanged = true;
     } else {
-      logger.warn(MODULE, `Failed to read task history: ${historyResult.error}`);
+      logger.warn(MODULE, `Failed to read task history: ${historyResult.ok ? '' : historyResult.error}`);
     }
 
-    // Update aggregated metrics
+    // ─── Step 2: Update aggregated metrics (in-place) ───────
     const domain = ctx.classification?.domain ?? 'general';
-    updateMetrics(projectRoot, accuracy, domain, entry.tokens.consumed, entry.tokens.saved);
+    applyMetricsUpdate(metrics, accuracy, domain, entry.tokens.consumed, entry.tokens.saved);
+    metricsChanged = true;
 
-    // Update keyword index with discovered files
-    updateKeywordIndex(projectRoot, ctx.taskText, accuracy.falseNegatives);
-
-    // Update dependency graph with co-occurrence edges (Story 3.2)
-    try {
-      updateDependencyGraph(projectRoot, actualFiles);
-    } catch (error) {
-      logger.warn(MODULE, 'Dependency graph update failed (fail-open)', error);
+    // ─── Step 3: Update keyword index (in-place) ────────────
+    applyKeywordIndexUpdate(keywordIndex, ctx.taskText, accuracy.falseNegatives);
+    if (accuracy.falseNegatives.length > 0) {
+      keywordIndexChanged = true;
     }
 
-    // Run pattern detection (Story 3.2)
-    try {
-      const historyForPatterns = readTaskHistory(projectRoot);
-      const patternsResult = readPatterns(projectRoot);
-      if (historyForPatterns.ok && patternsResult.ok) {
-        const result = detectPatterns(historyForPatterns.value.tasks, patternsResult.value);
+    // ─── Step 3b: Prune keyword index periodically (L5) ─────
+    const projectMap = ctx.storeCache?.projectMap;
+    if (projectMap && metrics.overall.totalTasks % KEYWORD_PRUNE_INTERVAL === 0) {
+      const pruned = pruneKeywordIndex(keywordIndex, projectMap);
+      if (pruned > 0) keywordIndexChanged = true;
+    }
+
+    // ─── Step 4: Update dependency graph (in-place) ─────────
+    if (graph) {
+      try {
+        if (applyDependencyGraphUpdate(graph, actualFiles)) {
+          graphChanged = true;
+        }
+      } catch (error) {
+        logger.warn(MODULE, 'Dependency graph update failed (fail-open)', error);
+      }
+    }
+
+    // ─── Step 5: Pattern detection (in-place) ───────────────
+    if (history && patterns) {
+      try {
+        const result = detectPatterns(history.tasks, patterns, projectMap);
         if (
           result.newCoOccurrences.length > 0 ||
           result.updatedCoOccurrences.length > 0 ||
@@ -412,73 +529,133 @@ export function captureOutcome(ctx: PipelineContext): void {
           result.updatedConventions.length > 0 ||
           Object.keys(result.newAffinities).length > 0
         ) {
-          const writeResult = writePatterns(projectRoot, patternsResult.value);
-          if (!writeResult.ok) {
-            logger.warn(MODULE, `Failed to write patterns: ${writeResult.error}`);
-          } else {
-            logger.debug(MODULE, `Pattern detection: ${result.newCoOccurrences.length} new co-occurrences, ${Object.keys(result.newAffinities).length} affinity types, ${result.newConventions.length} new conventions`);
-          }
+          patternsChanged = true;
+          logger.debug(MODULE, `Pattern detection: ${result.newCoOccurrences.length} new co-occurrences, ${Object.keys(result.newAffinities).length} affinity types, ${result.newConventions.length} new conventions`);
         }
+      } catch (error) {
+        logger.warn(MODULE, 'Pattern detection failed (fail-open)', error);
       }
-    } catch (error) {
-      logger.warn(MODULE, 'Pattern detection failed (fail-open)', error);
     }
 
-    // Adaptive signal weight learning (#4) + threshold learning (#6) + router learning (#7)
+    // ─── Step 6: Adaptive learning (all operate on metrics in-place) ─
     try {
-      const metricsForLearning = readMetrics(projectRoot);
-      if (metricsForLearning.ok) {
-        const m = metricsForLearning.value;
-        const actualFileSet = new Set(actualFiles.map(toInternal));
-        const predictions = ctx.prediction?.predictions ?? [];
+      const actualFileSet = new Set(actualFiles.map(toInternal));
+      const predictions = ctx.prediction?.predictions ?? [];
 
-        // #4: Update per-signal accuracy and learned weights
-        updateSignalAccuracy(m, predictions, actualFileSet);
-        updateLearnedWeights(m);
+      // #4: Signal accuracy and learned weights
+      updateSignalAccuracy(metrics, predictions, actualFileSet);
+      updateLearnedWeights(metrics);
 
-        // #9: Update per-domain signal accuracy and weights
-        const taskDomain = ctx.classification?.domain ?? 'unknown';
-        updateDomainSignalAccuracy(m, predictions, actualFileSet, taskDomain);
-        updateDomainLearnedWeights(m, taskDomain);
-
-        // #6: Update learned confidence thresholds per task type
-        const historyForThresholds = readTaskHistory(projectRoot);
-        if (historyForThresholds.ok) {
-          updateLearnedThresholds(m, historyForThresholds.value);
-        }
-
-        // #7: Update model performance tracking
+      // L7: Track missed opportunities for false negatives
+      if (accuracy.falseNegatives.length > 0 && graph && patterns) {
         const taskType = ctx.classification?.type ?? 'Unknown';
-        const complexity = ctx.classification?.complexity ?? 'Medium';
-        const model = ctx.routing?.model ?? 'sonnet';
-        const isSuccess = accuracy.precision >= 0.3;
-        const tokenCost = entry.tokens.consumed;
-        updateModelPerformance(m, model, taskType, complexity, isSuccess, tokenCost);
-
-        const writeResult = writeMetrics(projectRoot, m);
-        if (!writeResult.ok) {
-          logger.warn(MODULE, `Failed to write adaptive metrics: ${writeResult.error}`);
-        }
+        trackMissedOpportunities(metrics, accuracy.falseNegatives, taskType, keywordIndex, graph, patterns);
       }
+
+      // #9: Per-domain signal accuracy and weights
+      const taskDomain = ctx.classification?.domain ?? 'unknown';
+      updateDomainSignalAccuracy(metrics, predictions, actualFileSet, taskDomain);
+      updateDomainLearnedWeights(metrics, taskDomain);
+
+      // #6: Learned confidence thresholds
+      if (history) {
+        updateLearnedThresholds(metrics, history);
+      }
+
+      // #7 + L13 + L14 + L15: Model performance tracking with composite success score
+      const taskType = ctx.classification?.type ?? 'Unknown';
+      const complexity = ctx.classification?.complexity ?? 'Medium';
+      const model = ctx.routing?.model ?? 'sonnet';
+
+      // L13: Continuous success score (0-1) instead of binary
+      // L15: Multi-factor composite: precision×0.4 + recall×0.2 + feedback×0.3 + tokenEff×0.1
+      const feedbackScore = 0.5; // neutral default (no feedback available during capture)
+      const tokenEfficiency = entry.tokens.budgeted > 0
+        ? 1 - Math.min(entry.tokens.consumed / entry.tokens.budgeted, 1)
+        : 0.5;
+      const successScore = Math.min(Math.max(
+        accuracy.precision * 0.4 +
+        accuracy.recall * 0.2 +
+        feedbackScore * 0.3 +
+        tokenEfficiency * 0.1,
+        0), 1);
+
+      const tokenCost = entry.tokens.consumed;
+      // L14: Pass duration from adapter result
+      const durationMs = ctx.adapterResult?.durationMs;
+      updateModelPerformance(metrics, model, taskType, complexity, successScore, tokenCost, durationMs);
+
+      metricsChanged = true;
     } catch (error) {
       logger.warn(MODULE, 'Adaptive learning failed (fail-open)', error);
     }
 
-    // Run weight corrections (Story 3.3)
-    try {
-      const predictionConfidences = ctx.prediction?.predictions.map((p) => p.score) ?? [];
-      const metricsResult = readMetrics(projectRoot);
-      const sessionCount = metricsResult.ok ? metricsResult.value.overall.totalSessions : 1;
-      runWeightCorrection(
-        predictedFiles,
-        actualFiles,
-        predictionConfidences,
-        entry.id,
-        projectRoot,
-        sessionCount,
-      );
-    } catch (error) {
-      logger.warn(MODULE, 'Weight correction failed (fail-open)', error);
+    // ─── Step 6b: Learn empirical multiplier (L4) ─────────────────
+    if (history && metrics.overall.totalTasks >= MIN_MULTIPLIER_TASKS) {
+      try {
+        const allTasks = history.tasks;
+        // Baseline: average tokens per task from first N tasks (before optimization warms up)
+        const baselineTasks = allTasks.slice(0, BASELINE_TASK_WINDOW);
+        const recentTasks = allTasks.slice(-BASELINE_TASK_WINDOW);
+
+        if (baselineTasks.length >= BASELINE_TASK_WINDOW && recentTasks.length >= BASELINE_TASK_WINDOW) {
+          const baselineAvg = baselineTasks.reduce((s, t) => s + t.tokens.consumed, 0) / baselineTasks.length;
+          const recentAvg = recentTasks.reduce((s, t) => s + t.tokens.consumed, 0) / recentTasks.length;
+
+          if (recentAvg > 0) {
+            const empirical = Math.max(baselineAvg / recentAvg, MIN_MULTIPLIER);
+            metrics.empiricalMultiplier = empirical;
+            logger.debug(MODULE, `L4: Empirical multiplier = ${empirical.toFixed(2)} (baseline=${baselineAvg.toFixed(0)}, recent=${recentAvg.toFixed(0)})`);
+          }
+        }
+      } catch (error) {
+        logger.warn(MODULE, 'Empirical multiplier computation failed (fail-open)', error);
+      }
+    }
+
+    // ─── Step 7: Weight corrections (in-place on graph + patterns) ──
+    if (graph && patterns) {
+      try {
+        const predictionConfidences = ctx.prediction?.predictions.map((p) => p.score) ?? [];
+        const sessionCount = metrics.overall.totalSessions;
+        const historyTasks = history?.tasks ?? [];
+
+        const wcResult = runWeightCorrectionInPlace(
+          predictedFiles, actualFiles, predictionConfidences,
+          entry.id, graph, patterns, historyTasks, sessionCount,
+        );
+
+        if (wcResult.graphUpdated) graphChanged = true;
+        if (wcResult.patternsUpdated) patternsChanged = true;
+      } catch (error) {
+        logger.warn(MODULE, 'Weight correction failed (fail-open)', error);
+      }
+    }
+
+    // ─── L1: Write all stores once ──────────────────────────
+    if (historyChanged && history) {
+      const writeResult = writeTaskHistory(projectRoot, history);
+      if (!writeResult.ok) logger.warn(MODULE, `Failed to write task history: ${writeResult.error}`);
+    }
+
+    if (metricsChanged) {
+      const writeResult = writeMetrics(projectRoot, metrics);
+      if (!writeResult.ok) logger.warn(MODULE, `Failed to write metrics: ${writeResult.error}`);
+    }
+
+    if (keywordIndexChanged) {
+      const writeResult = writeKeywordIndex(projectRoot, keywordIndex);
+      if (!writeResult.ok) logger.warn(MODULE, `Failed to write keyword index: ${writeResult.error}`);
+    }
+
+    if (graphChanged && graph) {
+      const writeResult = writeDependencyGraph(projectRoot, graph);
+      if (!writeResult.ok) logger.warn(MODULE, `Failed to write dependency graph: ${writeResult.error}`);
+    }
+
+    if (patternsChanged && patterns) {
+      const writeResult = writePatterns(projectRoot, patterns);
+      if (!writeResult.ok) logger.warn(MODULE, `Failed to write patterns: ${writeResult.error}`);
     }
 
     const elapsed = performance.now() - startTime;

@@ -3,9 +3,9 @@
  * and conventions from task history. (Story 3.2)
  */
 
-import type { TaskEntry, Patterns, CoOccurrence, Convention } from '../types/index.js';
+import type { TaskEntry, Patterns, CoOccurrence, Convention, ProjectMap } from '../types/index.js';
 import { toInternal } from '../utils/index.js';
-import type { PatternDetectionResult, TypeAffinities } from './types.js';
+import type { PatternDetectionResult, TypeAffinities, ConventionDetector } from './types.js';
 import {
   CO_OCCURRENCE_THRESHOLD,
   AFFINITY_MIN_OCCURRENCES,
@@ -13,6 +13,7 @@ import {
   CONVENTION_MIN_EVIDENCE,
   CONVENTION_MIN_CONFIDENCE,
   RECENT_HISTORY_WINDOW,
+  MAX_COOCCURRENCE_FILES,
 } from './types.js';
 
 /**
@@ -54,7 +55,10 @@ export function detectCoOccurrences(
   const pairFrequency = new Map<string, { fileA: string; fileB: string; count: number }>();
 
   for (const task of recentTasks) {
-    const files = task.prediction.actualFiles.map(toInternal);
+    const allFiles = task.prediction.actualFiles.map(toInternal);
+    // L17: Skip tasks with too many files (bulk operations) and cap pair computation
+    if (allFiles.length > MAX_COOCCURRENCE_FILES * 2) continue;
+    const files = allFiles.slice(0, MAX_COOCCURRENCE_FILES);
     for (let i = 0; i < files.length; i++) {
       for (let j = i + 1; j < files.length; j++) {
         const sorted = [files[i], files[j]].sort();
@@ -186,11 +190,154 @@ export function detectTypeAffinities(
   return newAffinities;
 }
 
-// ─── Convention Detection ─────────────────────────────────────
+// ─── Convention Detection (L18: Pluggable Detectors) ──────────
 
 /**
- * Detect recurring conventions from task history.
- * Looks for test co-location patterns, import patterns, and naming conventions.
+ * L18: Registry of pluggable convention detectors.
+ * Each detector looks for a specific pattern in task file history.
+ */
+const CONVENTION_DETECTORS: ConventionDetector[] = [
+  // Original 3 detectors (refactored)
+  {
+    id: 'test-colocation',
+    pattern: 'Test files co-located with source files',
+    detect(tasks) {
+      let count = 0;
+      const examples: string[] = [];
+      for (const task of tasks) {
+        const files = task.prediction.actualFiles.map(toInternal);
+        const hasTestAndSource = files.some((f) => /\.test\.|\.spec\.|__tests__/.test(f)) &&
+          files.some((f) => !/\.test\.|\.spec\.|__tests__/.test(f));
+        if (hasTestAndSource) {
+          count++;
+          const testFile = files.find((f) => /\.test\.|\.spec\.|__tests__/.test(f));
+          if (testFile && examples.length < 5) examples.push(testFile);
+        }
+      }
+      return count >= CONVENTION_MIN_EVIDENCE ? { evidence: count, examples } : null;
+    },
+  },
+  {
+    id: 'ts-js-source',
+    pattern: 'TypeScript/JavaScript source files used consistently',
+    detect(tasks) {
+      let count = 0;
+      const examples: string[] = [];
+      for (const task of tasks) {
+        const files = task.prediction.actualFiles.map(toInternal);
+        if (files.some((f) => /\.(js|ts)$/.test(f))) {
+          count++;
+          const jsFile = files.find((f) => /\.(js|ts)$/.test(f));
+          if (jsFile && examples.length < 5) examples.push(jsFile);
+        }
+      }
+      if (count < CONVENTION_MIN_EVIDENCE) return null;
+      const confidence = count / tasks.length;
+      return confidence >= CONVENTION_MIN_CONFIDENCE ? { evidence: count, examples } : null;
+    },
+  },
+  {
+    id: 'barrel-exports',
+    pattern: 'Barrel index files used for module exports',
+    detect(tasks) {
+      let count = 0;
+      const examples: string[] = [];
+      for (const task of tasks) {
+        const files = task.prediction.actualFiles.map(toInternal);
+        if (files.some((f) => /\/index\.(ts|js)$/.test(f))) {
+          count++;
+          const indexFile = files.find((f) => /\/index\.(ts|js)$/.test(f));
+          if (indexFile && examples.length < 5) examples.push(indexFile);
+        }
+      }
+      if (count < CONVENTION_MIN_EVIDENCE) return null;
+      const confidence = count / tasks.length;
+      return confidence >= CONVENTION_MIN_CONFIDENCE ? { evidence: count, examples } : null;
+    },
+  },
+  // L18: New detectors
+  {
+    id: 'css-component-pairing',
+    pattern: 'Style files paired with component files',
+    detect(tasks) {
+      let count = 0;
+      const examples: string[] = [];
+      for (const task of tasks) {
+        const files = task.prediction.actualFiles.map(toInternal);
+        const hasStyle = files.some((f) => /\.(css|scss|less|styled)\b/.test(f));
+        const hasComponent = files.some((f) => /\.(tsx|jsx|vue|svelte)$/.test(f));
+        if (hasStyle && hasComponent) {
+          count++;
+          const styleFile = files.find((f) => /\.(css|scss|less|styled)\b/.test(f));
+          if (styleFile && examples.length < 5) examples.push(styleFile);
+        }
+      }
+      return count >= CONVENTION_MIN_EVIDENCE ? { evidence: count, examples } : null;
+    },
+  },
+  {
+    id: 'migration-model-pairing',
+    pattern: 'Migration files paired with model changes',
+    detect(tasks) {
+      let count = 0;
+      const examples: string[] = [];
+      for (const task of tasks) {
+        const files = task.prediction.actualFiles.map(toInternal);
+        const hasMigration = files.some((f) => /migrat/i.test(f));
+        const hasModel = files.some((f) => /model|schema|entity/i.test(f));
+        if (hasMigration && hasModel) {
+          count++;
+          const migFile = files.find((f) => /migrat/i.test(f));
+          if (migFile && examples.length < 5) examples.push(migFile);
+        }
+      }
+      return count >= CONVENTION_MIN_EVIDENCE ? { evidence: count, examples } : null;
+    },
+  },
+  {
+    id: 'config-feature-pairing',
+    pattern: 'Config files paired with feature changes',
+    detect(tasks) {
+      let count = 0;
+      const examples: string[] = [];
+      for (const task of tasks) {
+        const files = task.prediction.actualFiles.map(toInternal);
+        const hasConfig = files.some((f) => /config|\.env|settings/i.test(f));
+        const hasFeature = files.some((f) => !/config|\.env|settings/i.test(f) && /\.(ts|js|py|go|rs)$/.test(f));
+        if (hasConfig && hasFeature) {
+          count++;
+          const configFile = files.find((f) => /config|\.env|settings/i.test(f));
+          if (configFile && examples.length < 5) examples.push(configFile);
+        }
+      }
+      if (count < CONVENTION_MIN_EVIDENCE) return null;
+      const confidence = count / tasks.length;
+      return confidence >= CONVENTION_MIN_CONFIDENCE ? { evidence: count, examples } : null;
+    },
+  },
+  {
+    id: 'middleware-hook-pairing',
+    pattern: 'Middleware/hook files paired with route handlers',
+    detect(tasks) {
+      let count = 0;
+      const examples: string[] = [];
+      for (const task of tasks) {
+        const files = task.prediction.actualFiles.map(toInternal);
+        const hasMiddleware = files.some((f) => /middleware|hook|interceptor|guard/i.test(f));
+        const hasHandler = files.some((f) => /route|controller|handler|endpoint|api/i.test(f));
+        if (hasMiddleware && hasHandler) {
+          count++;
+          const mwFile = files.find((f) => /middleware|hook|interceptor|guard/i.test(f));
+          if (mwFile && examples.length < 5) examples.push(mwFile);
+        }
+      }
+      return count >= CONVENTION_MIN_EVIDENCE ? { evidence: count, examples } : null;
+    },
+  },
+];
+
+/**
+ * Detect recurring conventions from task history (L18: pluggable detector registry).
  */
 export function detectConventions(
   recentTasks: TaskEntry[],
@@ -204,83 +351,16 @@ export function detectConventions(
     return { newConventions, updatedConventions };
   }
 
-  // Convention detectors
-  const conventionCandidates: Array<{
-    pattern: string;
-    evidence: number;
-    examples: string[];
-  }> = [];
+  // Run all pluggable detectors
+  const candidates: Array<{ pattern: string; evidence: number; examples: string[] }> = [];
 
-  // Detect test co-location pattern
-  let testCoLocationCount = 0;
-  const testCoLocationExamples: string[] = [];
-  for (const task of recentTasks) {
-    const files = task.prediction.actualFiles.map(toInternal);
-    const hasTestAndSource = files.some((f) => /\.test\.|\.spec\.|__tests__/.test(f)) &&
-      files.some((f) => !/\.test\.|\.spec\.|__tests__/.test(f));
-    if (hasTestAndSource) {
-      testCoLocationCount++;
-      const testFile = files.find((f) => /\.test\.|\.spec\.|__tests__/.test(f));
-      if (testFile && testCoLocationExamples.length < 5) {
-        testCoLocationExamples.push(testFile);
-      }
-    }
-  }
-  if (testCoLocationCount >= CONVENTION_MIN_EVIDENCE) {
-    conventionCandidates.push({
-      pattern: 'Test files co-located with source files',
-      evidence: testCoLocationCount,
-      examples: testCoLocationExamples,
-    });
-  }
-
-  // Detect .js extension in imports pattern
-  let jsExtensionCount = 0;
-  const jsExtensionExamples: string[] = [];
-  for (const task of recentTasks) {
-    const files = task.prediction.actualFiles.map(toInternal);
-    const hasJsFiles = files.some((f) => /\.(js|ts)$/.test(f));
-    if (hasJsFiles) {
-      jsExtensionCount++;
-      const jsFile = files.find((f) => /\.(js|ts)$/.test(f));
-      if (jsFile && jsExtensionExamples.length < 5) {
-        jsExtensionExamples.push(jsFile);
-      }
-    }
-  }
-  // Only detect if consistently present
-  if (jsExtensionCount >= CONVENTION_MIN_EVIDENCE) {
-    const confidence = jsExtensionCount / totalTasks;
-    if (confidence >= CONVENTION_MIN_CONFIDENCE) {
-      conventionCandidates.push({
-        pattern: 'TypeScript/JavaScript source files used consistently',
-        evidence: jsExtensionCount,
-        examples: jsExtensionExamples,
-      });
-    }
-  }
-
-  // Detect index barrel pattern
-  let barrelPatternCount = 0;
-  const barrelExamples: string[] = [];
-  for (const task of recentTasks) {
-    const files = task.prediction.actualFiles.map(toInternal);
-    const hasIndex = files.some((f) => /\/index\.(ts|js)$/.test(f));
-    if (hasIndex) {
-      barrelPatternCount++;
-      const indexFile = files.find((f) => /\/index\.(ts|js)$/.test(f));
-      if (indexFile && barrelExamples.length < 5) {
-        barrelExamples.push(indexFile);
-      }
-    }
-  }
-  if (barrelPatternCount >= CONVENTION_MIN_EVIDENCE) {
-    const confidence = barrelPatternCount / totalTasks;
-    if (confidence >= CONVENTION_MIN_CONFIDENCE) {
-      conventionCandidates.push({
-        pattern: 'Barrel index files used for module exports',
-        evidence: barrelPatternCount,
-        examples: barrelExamples,
+  for (const detector of CONVENTION_DETECTORS) {
+    const result = detector.detect(recentTasks);
+    if (result) {
+      candidates.push({
+        pattern: detector.pattern,
+        evidence: result.evidence,
+        examples: result.examples,
       });
     }
   }
@@ -289,15 +369,13 @@ export function detectConventions(
   const existingPatterns = new Set(currentPatterns.conventions.map((c) => c.pattern));
   const existingIds = currentPatterns.conventions.map((c) => c.id ?? '');
 
-  for (const candidate of conventionCandidates) {
+  for (const candidate of candidates) {
     const confidence = candidate.evidence / totalTasks;
     if (confidence < CONVENTION_MIN_CONFIDENCE) continue;
 
-    // Check for duplicate by pattern similarity
     const isExisting = existingPatterns.has(candidate.pattern);
 
     if (isExisting) {
-      // Update existing convention
       const existing = currentPatterns.conventions.find((c) => c.pattern === candidate.pattern);
       if (existing) {
         existing.confidence = confidence;
@@ -306,7 +384,6 @@ export function detectConventions(
         updatedConventions.push(existing);
       }
     } else {
-      // Create new convention
       const id = nextSequenceId('conv', existingIds);
       existingIds.push(id);
       const newConv: Convention = {
@@ -328,13 +405,55 @@ export function detectConventions(
 // ─── Main Detection Entry Point ───────────────────────────────
 
 /**
+ * Validate pattern file paths against projectMap (L19).
+ * Removes co-occurrences where either file doesn't exist and
+ * removes affinity entries for missing files.
+ */
+function pruneDeletedFiles(patterns: Patterns, projectMap: ProjectMap): number {
+  let pruned = 0;
+  const validFiles = new Set(Object.keys(projectMap.files));
+
+  // Prune co-occurrences referencing deleted files
+  const validCoOccs = patterns.coOccurrences.filter((coOcc) => {
+    const [fileA, fileB] = coOcc.files;
+    if (!validFiles.has(fileA) || !validFiles.has(fileB)) {
+      pruned++;
+      return false;
+    }
+    return true;
+  });
+  patterns.coOccurrences = validCoOccs;
+
+  // Prune type affinity entries for deleted files
+  for (const [, affinity] of Object.entries(patterns.typeAffinities)) {
+    if (!affinity.fileWeights) continue;
+    for (const filePath of Object.keys(affinity.fileWeights)) {
+      if (!validFiles.has(filePath)) {
+        delete affinity.fileWeights[filePath];
+        pruned++;
+      }
+    }
+    affinity.files = Object.keys(affinity.fileWeights);
+  }
+
+  return pruned;
+}
+
+/**
  * Run all pattern detection passes on recent task history.
  * Mutates currentPatterns in place and returns a summary of changes.
+ * L19: Optionally validates file paths against projectMap.
  */
 export function detectPatterns(
   taskHistory: TaskEntry[],
   currentPatterns: Patterns,
+  projectMap?: ProjectMap,
 ): PatternDetectionResult {
+  // L19: Prune patterns referencing deleted files
+  if (projectMap) {
+    pruneDeletedFiles(currentPatterns, projectMap);
+  }
+
   // Take the most recent N tasks
   const recentTasks = taskHistory.slice(-RECENT_HISTORY_WINDOW);
 

@@ -1,5 +1,5 @@
-export { captureOutcome, compareAccuracy, updateMetrics, updateKeywordIndex, extractKeywords, resetSession, updateDependencyGraph } from './knowledge-learner.js';
-export type { LearningOutcome, AccuracyMetrics, WeightUpdate, OutcomeCapture, PatternDetectionResult, TypeAffinities, WeightCorrection, StaleEntry, WeightCorrectionResult } from './types.js';
+export { captureOutcome, compareAccuracy, updateMetrics, updateKeywordIndex, extractKeywords, resetSession, updateDependencyGraph, applyMetricsUpdate, applyKeywordIndexUpdate, applyDependencyGraphUpdate, pruneKeywordIndex } from './knowledge-learner.js';
+export type { LearningOutcome, AccuracyMetrics, WeightUpdate, OutcomeCapture, PatternDetectionResult, TypeAffinities, WeightCorrection, StaleEntry, WeightCorrectionResult, ConventionDetector } from './types.js';
 export {
   MAX_CAPTURE_TIME_MS,
   CO_OCCURRENCE_THRESHOLD, AFFINITY_MIN_OCCURRENCES, AFFINITY_MIN_WEIGHT,
@@ -8,9 +8,12 @@ export {
   RECENT_HISTORY_WINDOW,
   BOOST_FACTOR, DECAY_FACTOR, WEIGHT_FLOOR, WEIGHT_CEILING,
   STALE_THRESHOLD_SESSIONS, STALE_DECAY_RATE, FULLY_STALE_WEIGHT,
+  MAX_COOCCURRENCE_FILES, KEYWORD_PRUNE_INTERVAL,
+  ACCURACY_DECAY, SINGLE_SIGNAL_EMA, MIN_TASKS_PER_DOMAIN_TYPE, RECENCY_HALF_LIFE_DAYS,
+  MIN_MULTIPLIER_TASKS, MIN_MULTIPLIER, BASELINE_TASK_WINDOW, DURATION_COST_BLEND,
 } from './types.js';
 export { detectPatterns, detectCoOccurrences, detectTypeAffinities, detectConventions } from './pattern-detector.js';
-export { correctWeights, applyWeightCorrections, applyWeightToPatterns, decayStaleEntries, runWeightCorrection } from './weight-correction.js';
-export { updateSignalAccuracy, updateLearnedWeights, resolveSignalWeights, updateDomainSignalAccuracy, updateDomainLearnedWeights } from './signal-weight-learner.js';
+export { correctWeights, applyWeightCorrections, applyWeightToPatterns, decayStaleEntries, runWeightCorrection, correctWeightsFromGraph, applyWeightCorrectionsInPlace, applyWeightToPatternsInPlace, decayStaleEntriesInPlace, runWeightCorrectionInPlace } from './weight-correction.js';
+export { updateSignalAccuracy, updateLearnedWeights, resolveSignalWeights, updateDomainSignalAccuracy, updateDomainLearnedWeights, trackMissedOpportunities } from './signal-weight-learner.js';
 export { updateLearnedThresholds } from './threshold-learner.js';
 export { updateModelPerformance, selectLearnedModel, MIN_OBSERVATIONS } from './router-learner.js';

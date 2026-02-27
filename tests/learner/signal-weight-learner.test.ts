@@ -57,9 +57,10 @@ describe('updateSignalAccuracy', () => {
     updateSignalAccuracy(metrics, [makePrediction('src/a.ts', [{ source: SignalSource.KeywordLookup }])], actual);
     updateSignalAccuracy(metrics, [makePrediction('src/b.ts', [{ source: SignalSource.KeywordLookup }])], actual);
 
-    expect(metrics.signalAccuracy![SignalSource.KeywordLookup].totalPredictions).toBe(2);
-    expect(metrics.signalAccuracy![SignalSource.KeywordLookup].truePositives).toBe(1);
-    expect(metrics.signalAccuracy![SignalSource.KeywordLookup].falsePositives).toBe(1);
+    // L8: Temporal decay means values are slightly below exact integers (0.995 decay)
+    expect(metrics.signalAccuracy![SignalSource.KeywordLookup].totalPredictions).toBeCloseTo(2, 1);
+    expect(metrics.signalAccuracy![SignalSource.KeywordLookup].truePositives).toBeCloseTo(1, 1);
+    expect(metrics.signalAccuracy![SignalSource.KeywordLookup].falsePositives).toBeCloseTo(1, 1);
   });
 });
 

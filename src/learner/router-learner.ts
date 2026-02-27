@@ -1,12 +1,17 @@
 /**
  * Router Learning (#7).
- * Tracks model performance per model × taskType × complexity combination.
+ * Tracks model performance per model x taskType x complexity combination.
  * Uses Bayesian success rate with cost penalty to recommend optimal models.
- * Allows de-escalation (e.g., Sonnet → Haiku) when cheaper model proves effective.
+ * Allows de-escalation (e.g., Sonnet -> Haiku) when cheaper model proves effective.
+ *
+ * L13: Continuous success score (replaces binary isSuccess).
+ * L14: Tracks wall-clock duration, factors into cost-adjusted score.
+ * L16: Flexible cost baseline — uses cheapest model with data, not hardcoded Haiku.
  */
 
 import type { Metrics, ModelPerformance, Config } from '../types/index.js';
 import { logger } from '../utils/index.js';
+import { DURATION_COST_BLEND } from './types.js';
 
 const MODULE = 'learner:router';
 
@@ -19,6 +24,9 @@ const SINGLE_MODEL_MIN_OBS = 5;
 const INFER_DOWN_THRESHOLD = 0.9;
 /** R6: Success rate below which we infer the tier above is needed. */
 const INFER_UP_THRESHOLD = 0.6;
+
+/** Minimum observations for a model to serve as cost baseline (L16). */
+const BASELINE_MIN_OBS = 3;
 
 /** Default cost multipliers per model tier (relative to Haiku). */
 const DEFAULT_COST_MULTIPLIERS: Record<string, number> = {
@@ -50,14 +58,18 @@ function perfKey(model: string, taskType: string, complexity: string): string {
 
 /**
  * Update model performance tracking after a task completes.
+ *
+ * L13: Accepts continuous successScore [0,1] instead of binary isSuccess.
+ * L14: Optionally tracks wall-clock duration.
  */
 export function updateModelPerformance(
   metrics: Metrics,
   model: string,
   taskType: string,
   complexity: string,
-  isSuccess: boolean,
+  successScore: number,
   tokenCost: number,
+  durationMs?: number,
 ): void {
   if (!metrics.modelPerformance) {
     metrics.modelPerformance = {};
@@ -76,34 +88,59 @@ export function updateModelPerformance(
 
   const perf = metrics.modelPerformance[key];
   perf.totalTasks++;
-  if (isSuccess) {
-    perf.successes++;
-  } else {
-    perf.failures++;
-  }
+
+  // L13: Weighted success accumulation (continuous score)
+  perf.successes += successScore;
+  perf.failures += (1 - successScore);
+
   // Running average of token cost
   perf.avgTokenCost = perf.avgTokenCost + (tokenCost - perf.avgTokenCost) / perf.totalTasks;
 
-  logger.debug(MODULE, `${key}: ${perf.successes}/${perf.totalTasks} success, avg cost ${perf.avgTokenCost.toFixed(0)}`);
+  // L14: Track average duration
+  if (durationMs != null && durationMs > 0) {
+    perf.avgDurationMs = (perf.avgDurationMs ?? 0) + (durationMs - (perf.avgDurationMs ?? 0)) / perf.totalTasks;
+  }
+
+  logger.debug(MODULE, `${key}: ${perf.successes.toFixed(1)}/${perf.totalTasks} success, avg cost ${perf.avgTokenCost.toFixed(0)}`);
 }
 
 /**
  * Bayesian success rate with Laplace smoothing.
  * (successes + 1) / (total + 2)
+ * L13: Works with continuous weighted successes.
  */
 function bayesianSuccessRate(perf: ModelPerformance): number {
   return (perf.successes + 1) / (perf.totalTasks + 2);
 }
 
 /**
+ * L16: Find the cheapest model with sufficient data as cost baseline.
+ * Iterates MODEL_TIERS in order (cheapest first).
+ * Falls back to null if no model qualifies.
+ */
+function findCostBaseline(
+  allPerf: Record<string, ModelPerformance>,
+  taskType: string,
+  complexity: string,
+): { model: string; perf: ModelPerformance } | null {
+  for (const model of MODEL_TIERS) {
+    const key = perfKey(model, taskType, complexity);
+    const perf = allPerf[key];
+    if (perf && perf.totalTasks >= BASELINE_MIN_OBS && perf.avgTokenCost > 0) {
+      return { model, perf };
+    }
+  }
+  return null;
+}
+
+/**
  * Compute cost-adjusted score for a model.
  * Higher is better: successRate / effectiveCost
  *
- * R7: Blends fixed cost multiplier with observed relative token cost
- * when sufficient data is available. Uses Haiku's average token cost
- * as the baseline. Falls back to fixed multiplier when insufficient data.
- *
+ * R7: Blends fixed cost multiplier with observed relative token cost.
  * R8: Uses configurable cost multipliers.
+ * L14: Factors in duration when available.
+ * L16: Uses cheapest available model as baseline (not hardcoded Haiku).
  */
 function costAdjustedScore(
   perf: ModelPerformance,
@@ -117,16 +154,21 @@ function costAdjustedScore(
   const costMultipliers = getCostMultipliers(config);
   const fixedMult = costMultipliers[model] ?? 3;
 
-  // R7: Blend with actual token cost if available
+  // L16: Find cheapest baseline with sufficient data (not hardcoded Haiku)
   if (allPerf && taskType && complexity) {
-    const haikuKey = perfKey('haiku', taskType, complexity);
-    const haikuPerf = allPerf[haikuKey];
+    const baseline = findCostBaseline(allPerf, taskType, complexity);
 
-    // Need Haiku baseline with enough data to compute relative cost
-    if (haikuPerf && haikuPerf.totalTasks >= 3 && haikuPerf.avgTokenCost > 0 && perf.avgTokenCost > 0) {
-      const observedRelativeCost = perf.avgTokenCost / haikuPerf.avgTokenCost;
+    if (baseline && baseline.perf.avgTokenCost > 0 && perf.avgTokenCost > 0) {
+      const observedRelativeCost = perf.avgTokenCost / baseline.perf.avgTokenCost;
       // Blend 50/50: fixed multiplier + observed relative cost
-      const effectiveCost = 0.5 * fixedMult + 0.5 * observedRelativeCost;
+      let effectiveCost = 0.5 * fixedMult + 0.5 * observedRelativeCost;
+
+      // L14: Blend in duration cost if both models have duration data
+      if (perf.avgDurationMs && baseline.perf.avgDurationMs && baseline.perf.avgDurationMs > 0) {
+        const relativeDuration = perf.avgDurationMs / baseline.perf.avgDurationMs;
+        effectiveCost = (1 - DURATION_COST_BLEND) * effectiveCost + DURATION_COST_BLEND * relativeDuration;
+      }
+
       return successRate / Math.max(effectiveCost, 0.1);
     }
   }
@@ -147,6 +189,8 @@ function costAdjustedScore(
  *
  * R7: Uses actual token cost data blended with fixed multipliers.
  * R8: Uses configurable cost multipliers from config.
+ * L14: Factors in execution duration.
+ * L16: Uses flexible cost baseline.
  *
  * @param config - Optional config for R8 cost multiplier overrides
  */
@@ -167,7 +211,6 @@ export function selectLearnedModel(
 
     candidates.push({
       model,
-      // R7/R8: Pass all perf data + config for token cost blending
       score: costAdjustedScore(perf, model, metrics.modelPerformance, taskType, complexity, config),
       perf,
     });
@@ -175,7 +218,6 @@ export function selectLearnedModel(
 
   // R6: Single-model inference — infer from one model's performance
   if (candidates.length === 0) {
-    // Check if any single model has enough data for inference
     for (const model of MODEL_TIERS) {
       const key = perfKey(model, taskType, complexity);
       const perf = metrics.modelPerformance?.[key];
@@ -183,31 +225,22 @@ export function selectLearnedModel(
 
       const successRate = bayesianSuccessRate(perf);
 
-      // High success rate → try cheaper model
       if (successRate > INFER_DOWN_THRESHOLD) {
         const below = TIER_BELOW[model];
         if (below) {
-          logger.debug(
-            MODULE,
-            `R6 infer down: ${model} succeeds ${(successRate * 100).toFixed(0)}% → suggesting ${below}`,
-          );
+          logger.debug(MODULE, `R6 infer down: ${model} succeeds ${(successRate * 100).toFixed(0)}% -> suggesting ${below}`);
           return below;
         }
       }
 
-      // Low success rate → try more capable model
       if (successRate < INFER_UP_THRESHOLD) {
         const above = TIER_ABOVE[model];
         if (above) {
-          logger.debug(
-            MODULE,
-            `R6 infer up: ${model} succeeds ${(successRate * 100).toFixed(0)}% → suggesting ${above}`,
-          );
+          logger.debug(MODULE, `R6 infer up: ${model} succeeds ${(successRate * 100).toFixed(0)}% -> suggesting ${above}`);
           return above;
         }
       }
 
-      // Middle ground — stick with what we have
       return model;
     }
 
@@ -220,7 +253,7 @@ export function selectLearnedModel(
   const best = candidates[0];
   logger.debug(
     MODULE,
-    `Learned model for ${taskType}:${complexity}: ${best.model} (score=${best.score.toFixed(3)}, ${best.perf.successes}/${best.perf.totalTasks} success)`,
+    `Learned model for ${taskType}:${complexity}: ${best.model} (score=${best.score.toFixed(3)}, ${best.perf.successes.toFixed(1)}/${best.perf.totalTasks} success)`,
   );
 
   return best.model;

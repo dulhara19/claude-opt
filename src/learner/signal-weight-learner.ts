@@ -7,10 +7,11 @@
  * using an exponential moving average of per-signal precision.
  */
 
-import type { Metrics, SignalAccuracy } from '../types/index.js';
+import type { Metrics, SignalAccuracy, KeywordIndex, DependencyGraph, Patterns } from '../types/index.js';
 import type { FilePrediction, SignalWeights } from '../predictor/types.js';
 import { SignalSource, DEFAULT_SIGNAL_WEIGHTS } from '../predictor/types.js';
-import { logger } from '../utils/index.js';
+import { toInternal, logger } from '../utils/index.js';
+import { ACCURACY_DECAY, SINGLE_SIGNAL_EMA } from './types.js';
 
 const MODULE = 'learner:signal-weights';
 
@@ -54,41 +55,128 @@ export function updateSignalAccuracy(
         metrics.signalAccuracy[source] = { truePositives: 0, falsePositives: 0, totalPredictions: 0 };
       }
       const acc = metrics.signalAccuracy[source];
-      acc.totalPredictions++;
-      if (isActual) {
-        acc.truePositives++;
-      } else {
-        acc.falsePositives++;
-      }
+      // L8: Apply temporal decay before adding new observation
+      acc.truePositives = acc.truePositives * ACCURACY_DECAY + (isActual ? 1 : 0);
+      acc.falsePositives = acc.falsePositives * ACCURACY_DECAY + (isActual ? 0 : 1);
+      acc.totalPredictions = acc.truePositives + acc.falsePositives;
     }
   }
 }
 
 /**
+ * Track missed opportunities for signals that had data for false negative files (L7).
+ * For each false negative, checks which signals could have scored it.
+ */
+export function trackMissedOpportunities(
+  metrics: Metrics,
+  falseNegatives: string[],
+  taskType: string,
+  keywordIndex: KeywordIndex,
+  graph: DependencyGraph,
+  patterns: Patterns,
+): void {
+  if (falseNegatives.length === 0) return;
+  if (!metrics.signalAccuracy) metrics.signalAccuracy = {};
+
+  for (const rawFile of falseNegatives) {
+    const file = toInternal(rawFile);
+
+    // KeywordLookup: file exists in keyword index
+    if (keywordIndex.fileToKeywords[file]?.length) {
+      incrementMissed(metrics.signalAccuracy, SignalSource.KeywordLookup);
+    }
+    // GraphTraversal: file has adjacency entries
+    if (graph.adjacency[file]) {
+      incrementMissed(metrics.signalAccuracy, SignalSource.GraphTraversal);
+    }
+    // TypeAffinity: file is in affinity for this task type
+    if (patterns.typeAffinities[taskType]?.fileWeights?.[file]) {
+      incrementMissed(metrics.signalAccuracy, SignalSource.TypeAffinity);
+    }
+    // CooccurrenceBoost: file appears in a co-occurrence pattern
+    if (patterns.coOccurrences.some((co) => co.files[0] === file || co.files[1] === file)) {
+      incrementMissed(metrics.signalAccuracy, SignalSource.CooccurrenceBoost);
+    }
+  }
+}
+
+function incrementMissed(accuracy: Record<string, SignalAccuracy>, source: SignalSource): void {
+  if (!accuracy[source]) {
+    accuracy[source] = { truePositives: 0, falsePositives: 0, totalPredictions: 0 };
+  }
+  accuracy[source].missedOpportunities = (accuracy[source].missedOpportunities ?? 0) + 1;
+}
+
+/**
+ * Compute adjusted precision that factors in missed opportunities (L7).
+ * adjustedPrecision = TP / (TP + FP + 0.5 × missedOpportunities)
+ */
+function adjustedPrecision(acc: SignalAccuracy): number {
+  const missed = acc.missedOpportunities ?? 0;
+  const denominator = acc.truePositives + acc.falsePositives + 0.5 * missed;
+  return denominator > 0 ? acc.truePositives / denominator : 0;
+}
+
+/**
  * Compute new learned signal weights using EMA of per-signal precision.
- * Formula: newWeight = EMA_ALPHA * (precision / sumPrecisions) + (1 - EMA_ALPHA) * currentWeight
+ * L7: Uses adjusted precision (factors in missed opportunities).
+ * L9: Single-signal learning with conservative EMA rate.
  * All weights are normalized to sum to 1.0, with a minimum floor.
  */
 export function updateLearnedWeights(metrics: Metrics): void {
   const accuracy = metrics.signalAccuracy;
   if (!accuracy) return;
 
-  // Compute precision for each signal
+  // Compute precision for each signal (L7: adjusted precision)
   const precisions: Record<string, number> = {};
   let totalPrecision = 0;
 
   for (const [source, acc] of Object.entries(accuracy)) {
     // Need minimum observations before learning
     if (acc.totalPredictions < 10) continue;
-    const precision = acc.totalPredictions > 0
-      ? acc.truePositives / acc.totalPredictions
-      : 0;
+    const precision = adjustedPrecision(acc);
     precisions[source] = precision;
     totalPrecision += precision;
   }
 
-  // Need at least 2 signals with enough data to learn
-  if (Object.keys(precisions).length < 2 || totalPrecision === 0) return;
+  const signalCount = Object.keys(precisions).length;
+
+  // L9: Single-signal learning — conservative adjustment when only 1 signal qualifies
+  if (signalCount === 1 && totalPrecision > 0) {
+    const [source, precision] = Object.entries(precisions)[0];
+
+    const currentWeights: Record<string, number> = metrics.learnedSignalWeights
+      ? { ...metrics.learnedSignalWeights }
+      : {};
+
+    // Fill defaults
+    for (const [src, key] of Object.entries(SIGNAL_KEY_MAP)) {
+      if (!(src in currentWeights)) {
+        currentWeights[src] = DEFAULT_SIGNAL_WEIGHTS[key];
+      }
+    }
+
+    // Conservative single-signal update (half EMA rate)
+    const current = currentWeights[source] ?? 0.15;
+    const target = Math.max(precision, MIN_WEIGHT);
+    const updated = SINGLE_SIGNAL_EMA * target + (1 - SINGLE_SIGNAL_EMA) * current;
+    currentWeights[source] = Math.max(updated, MIN_WEIGHT);
+
+    // Normalize
+    const totalWeight = Object.values(currentWeights).reduce((a, b) => a + b, 0);
+    if (totalWeight > 0) {
+      for (const key of Object.keys(currentWeights)) {
+        currentWeights[key] = currentWeights[key] / totalWeight;
+      }
+    }
+
+    metrics.learnedSignalWeights = currentWeights;
+    logger.debug(MODULE, `Single-signal update for ${source}: ${updated.toFixed(3)}`);
+    return;
+  }
+
+  // Need at least 2 signals with enough data for full learning
+  if (signalCount < 2 || totalPrecision === 0) return;
 
   // Get current weights (learned or default)
   const currentWeights: Record<string, number> = metrics.learnedSignalWeights
@@ -149,12 +237,10 @@ export function updateDomainSignalAccuracy(
         metrics.domainSignalAccuracy[key] = { truePositives: 0, falsePositives: 0, totalPredictions: 0 };
       }
       const acc = metrics.domainSignalAccuracy[key];
-      acc.totalPredictions++;
-      if (isActual) {
-        acc.truePositives++;
-      } else {
-        acc.falsePositives++;
-      }
+      // L8: Apply temporal decay before adding new observation
+      acc.truePositives = acc.truePositives * ACCURACY_DECAY + (isActual ? 1 : 0);
+      acc.falsePositives = acc.falsePositives * ACCURACY_DECAY + (isActual ? 0 : 1);
+      acc.totalPredictions = acc.truePositives + acc.falsePositives;
     }
   }
 }
@@ -174,12 +260,45 @@ export function updateDomainLearnedWeights(metrics: Metrics, domain: string): vo
     if (!key.startsWith(`${domain}:`)) continue;
     if (acc.totalPredictions < MIN_DOMAIN_TASKS) continue;
     const source = key.slice(domain.length + 1);
-    const precision = acc.truePositives / acc.totalPredictions;
+    // L7: Use adjusted precision
+    const precision = adjustedPrecision(acc);
     precisions[source] = precision;
     totalPrecision += precision;
   }
 
-  if (Object.keys(precisions).length < 2 || totalPrecision === 0) return;
+  const signalCount = Object.keys(precisions).length;
+
+  // L9: Single-signal domain learning
+  if (signalCount === 1 && totalPrecision > 0) {
+    if (!metrics.domainSignalWeights) metrics.domainSignalWeights = {};
+
+    const [source, precision] = Object.entries(precisions)[0];
+    const currentWeights: Record<string, number> = metrics.domainSignalWeights[domain]
+      ? { ...metrics.domainSignalWeights[domain] }
+      : metrics.learnedSignalWeights
+        ? { ...metrics.learnedSignalWeights }
+        : {};
+
+    for (const [src, key] of Object.entries(SIGNAL_KEY_MAP)) {
+      if (!(src in currentWeights)) currentWeights[src] = DEFAULT_SIGNAL_WEIGHTS[key];
+    }
+
+    const current = currentWeights[source] ?? 0.15;
+    const target = Math.max(precision, MIN_WEIGHT);
+    const updated = SINGLE_SIGNAL_EMA * target + (1 - SINGLE_SIGNAL_EMA) * current;
+    currentWeights[source] = Math.max(updated, MIN_WEIGHT);
+
+    const totalWeight = Object.values(currentWeights).reduce((a, b) => a + b, 0);
+    if (totalWeight > 0) {
+      for (const k of Object.keys(currentWeights)) currentWeights[k] = currentWeights[k] / totalWeight;
+    }
+
+    metrics.domainSignalWeights[domain] = currentWeights;
+    logger.debug(MODULE, `Single-signal domain update for ${domain}:${source}`);
+    return;
+  }
+
+  if (signalCount < 2 || totalPrecision === 0) return;
 
   if (!metrics.domainSignalWeights) {
     metrics.domainSignalWeights = {};

@@ -63,12 +63,16 @@ export interface OutcomeCapture {
     taskType: string;
     complexity: string;
     confidence: number;
+    /** Domain classification (L2). */
+    domain: string;
   };
   prediction: {
     predictedFiles: string[];
     actualFiles: string[];
     precision: number;
     recall: number;
+    /** Per-file confidence scores, parallel to predictedFiles (L3). */
+    predictedScores: number[];
   };
   routing: {
     model: string;
@@ -80,6 +84,8 @@ export interface OutcomeCapture {
     saved: number;
   };
   feedback: null;
+  /** Session number when this task was captured (L22). */
+  sessionId?: number;
 }
 
 /** Maximum capture time in milliseconds (performance budget). */
@@ -143,6 +149,50 @@ export const LEARNER_EDGE_MAX_WEIGHT = 0.9;
 
 /** Number of recent tasks to analyze for patterns. */
 export const RECENT_HISTORY_WINDOW = 50;
+
+/** Max files per task for co-occurrence pair computation (L17). */
+export const MAX_COOCCURRENCE_FILES = 15;
+
+/** Prune keyword index every N tasks (L5). */
+export const KEYWORD_PRUNE_INTERVAL = 50;
+
+/** Temporal decay factor for signal accuracy counters per update (L8). ~50% after 138 tasks. */
+export const ACCURACY_DECAY = 0.995;
+
+/** Conservative EMA rate for single-signal learning (L9). Half of normal EMA_ALPHA. */
+export const SINGLE_SIGNAL_EMA = 0.05;
+
+/** Minimum tasks per domain:type compound key for per-domain thresholds (L12). */
+export const MIN_TASKS_PER_DOMAIN_TYPE = 15;
+
+/** Recency half-life in days for threshold task weighting (L11). */
+export const RECENCY_HALF_LIFE_DAYS = 60;
+
+/** Minimum tasks before learning empirical multiplier (L4). */
+export const MIN_MULTIPLIER_TASKS = 20;
+
+/** Floor for empirical multiplier (L4). */
+export const MIN_MULTIPLIER = 1.5;
+
+/** Baseline window — first N tasks used as unoptimized reference (L4). */
+export const BASELINE_TASK_WINDOW = 5;
+
+/** Duration blend weight in cost-adjusted score (L14). 0.3 = 30% duration, 70% token cost. */
+export const DURATION_COST_BLEND = 0.3;
+
+// ─── Convention Detector Interface (L18) ──────────────────────
+
+import type { TaskEntry } from '../types/index.js';
+
+/**
+ * Pluggable convention detector interface (L18).
+ * Each detector looks for a specific pattern in task history.
+ */
+export interface ConventionDetector {
+  id: string;
+  pattern: string;
+  detect(tasks: TaskEntry[]): { evidence: number; examples: string[] } | null;
+}
 
 // ─── Weight Correction Types (Story 3.3) ──────────────────────
 
