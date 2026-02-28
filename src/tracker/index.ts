@@ -5,6 +5,7 @@ export {
   getActiveWindow,
   createWindow,
   isWindowExpired,
+  pruneExpiredWindows,
   resetSession,
 } from './token-tracker.js';
 export {
@@ -14,20 +15,30 @@ export {
   renderInlineWarning,
   renderBlockingWarning,
   renderExhaustedWarning,
+  renderAwarenessWarning,
   estimateRemainingTasks,
   formatNumber,
   formatPercent,
   renderProgressBar,
+  colorProgressBar,
+  PROMPT_TIMEOUT_MS,
+  getRecoverySuggestions,
+  estimateRemainingTasksForType,
 } from './budget-warnings.js';
+export type { BudgetCheckOptions } from './budget-warnings.js';
 export {
   estimateWindowTime,
+  projectBudgetExhaustion,
   formatTimeRemaining,
   formatResetTime,
+  detectBurnTrend,
+  compareBurnRateToHistory,
 } from './window-estimator.js';
 export type {
   TokenUsage,
   WindowStatus,
   SessionStats,
+  TaskTypeStats,
   TrackingResult,
   SavingsEstimate,
   WindowEntry,
@@ -36,4 +47,5 @@ export type {
   BudgetWarningLevel,
   BudgetCheckResult,
   WindowEstimate,
+  BurnTrend,
 } from './types.js';

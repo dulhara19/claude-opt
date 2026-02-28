@@ -9,10 +9,11 @@ import {
   getActiveWindow,
   createWindow,
   isWindowExpired,
+  pruneExpiredWindows,
   resetSession,
 } from '../../src/tracker/index.js';
 import type { WindowEntry } from '../../src/tracker/index.js';
-import { initializeStore } from '../../src/store/index.js';
+import { initializeStore, readMetrics } from '../../src/store/index.js';
 
 function createTestProject(): string {
   const dir = mkdtempSync(join(tmpdir(), 'claude-opt-tracker-test-'));
@@ -343,5 +344,296 @@ describe('trackUsage', () => {
     const avgMs = (performance.now() - start) / 10;
     // Allow some slack for CI/disk I/O — warn at 10ms, but test at 50ms
     expect(avgMs).toBeLessThan(50);
+  });
+
+  // TK2: Usage history persistence
+  it('persists usage history in metrics (TK2)', () => {
+    trackUsage({
+      taskId: 'hist-001',
+      tokensUsed: 400,
+      domain: 'auth',
+      predictionConfidence: 0.7,
+      compressionRatio: 0.3,
+      projectRoot,
+    });
+    trackUsage({
+      taskId: 'hist-002',
+      tokensUsed: 600,
+      domain: 'ui',
+      predictionConfidence: 0.5,
+      compressionRatio: 0.2,
+      projectRoot,
+    });
+
+    const metrics = readMetrics(projectRoot);
+    expect(metrics.ok).toBe(true);
+    if (!metrics.ok) return;
+
+    expect(metrics.value.recentUsage).toBeDefined();
+    expect(metrics.value.recentUsage!.length).toBe(2);
+    expect(metrics.value.recentUsage![0].taskId).toBe('hist-001');
+    expect(metrics.value.recentUsage![1].taskId).toBe('hist-002');
+    expect(metrics.value.recentUsage![1].tokensUsed).toBe(600);
+  });
+
+  it('caps usage history at MAX_USAGE_HISTORY (TK2)', () => {
+    // Write 205 entries — should be capped at 200
+    for (let i = 0; i < 205; i++) {
+      trackUsage({
+        taskId: `cap-${i}`,
+        tokensUsed: 10,
+        domain: 'general',
+        predictionConfidence: 0,
+        compressionRatio: 0,
+        projectRoot,
+      });
+    }
+
+    const metrics = readMetrics(projectRoot);
+    expect(metrics.ok).toBe(true);
+    if (!metrics.ok) return;
+
+    expect(metrics.value.recentUsage!.length).toBe(200);
+    // First entry should be cap-5 (oldest 5 dropped)
+    expect(metrics.value.recentUsage![0].taskId).toBe('cap-5');
+    expect(metrics.value.recentUsage![199].taskId).toBe('cap-204');
+  });
+
+  // TK6: Per-model tracking
+  it('tracks per-model token stats (TK6)', () => {
+    trackUsage({
+      taskId: 'model-001',
+      tokensUsed: 500,
+      domain: 'general',
+      predictionConfidence: 0.8,
+      compressionRatio: 0.3,
+      projectRoot,
+      modelTier: 'sonnet',
+    });
+    trackUsage({
+      taskId: 'model-002',
+      tokensUsed: 300,
+      domain: 'general',
+      predictionConfidence: 0.6,
+      compressionRatio: 0.2,
+      projectRoot,
+      modelTier: 'haiku',
+    });
+    trackUsage({
+      taskId: 'model-003',
+      tokensUsed: 200,
+      domain: 'general',
+      predictionConfidence: 0.9,
+      compressionRatio: 0.4,
+      projectRoot,
+      modelTier: 'sonnet',
+    });
+
+    const metrics = readMetrics(projectRoot);
+    expect(metrics.ok).toBe(true);
+    if (!metrics.ok) return;
+
+    expect(metrics.value.perModel).toBeDefined();
+    expect(metrics.value.perModel!['sonnet'].totalTasks).toBe(2);
+    expect(metrics.value.perModel!['sonnet'].totalTokensConsumed).toBe(700);
+    expect(metrics.value.perModel!['haiku'].totalTasks).toBe(1);
+    expect(metrics.value.perModel!['haiku'].totalTokensConsumed).toBe(300);
+  });
+
+  it('skips per-model tracking when modelTier is not provided (TK6)', () => {
+    trackUsage({
+      taskId: 'no-model',
+      tokensUsed: 500,
+      domain: 'general',
+      predictionConfidence: 0,
+      compressionRatio: 0,
+      projectRoot,
+    });
+
+    const metrics = readMetrics(projectRoot);
+    expect(metrics.ok).toBe(true);
+    if (!metrics.ok) return;
+    // perModel should not be populated
+    expect(metrics.value.perModel).toBeUndefined();
+  });
+
+  // TK1: StoreCache usage
+  it('uses storeCache when provided instead of disk reads (TK1)', () => {
+    const metricsResult = readMetrics(projectRoot);
+    expect(metricsResult.ok).toBe(true);
+    if (!metricsResult.ok) return;
+
+    const result = trackUsage({
+      taskId: 'cache-001',
+      tokensUsed: 500,
+      domain: 'general',
+      predictionConfidence: 0.5,
+      compressionRatio: 0.2,
+      projectRoot,
+      storeCache: {
+        metrics: metricsResult.value,
+        config: {
+          schemaVersion: '1',
+          projectName: 'test',
+          projectType: 'code',
+          tokenBudget: 50000,
+          windowDurationMs: 18_000_000,
+          budgetWarnings: { inline: 0.75, blocking: 0.9 },
+          doctorMode: 'off',
+          doctorThreshold: 0.7,
+          taskHistoryCap: 200,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        },
+      },
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    // Should use the custom budget from storeCache config
+    expect(result.value.windowStatus.budget).toBe(50000);
+  });
+});
+
+// TK4: Validated savings with prediction accuracy
+describe('estimateSavings with predictionAccuracy (TK4)', () => {
+  it('reduces savings when prediction accuracy is low', () => {
+    const withoutAccuracy = estimateSavings(800, 0.8, 0.5);
+    const withLowAccuracy = estimateSavings(800, 0.8, 0.5, 0.5);
+
+    // Low accuracy should produce less savings
+    expect(withLowAccuracy.saved).toBeLessThan(withoutAccuracy.saved);
+    expect(withLowAccuracy.savingsRate).toBeLessThan(withoutAccuracy.savingsRate);
+  });
+
+  it('produces same result when accuracy is 1.0 (perfect)', () => {
+    const withoutAccuracy = estimateSavings(800, 0.8, 0.5);
+    const withPerfectAccuracy = estimateSavings(800, 0.8, 0.5, 1.0);
+
+    expect(withPerfectAccuracy.saved).toBe(withoutAccuracy.saved);
+    expect(withPerfectAccuracy.savingsRate).toBe(withoutAccuracy.savingsRate);
+  });
+
+  it('returns zero savings when accuracy is 0', () => {
+    const result = estimateSavings(800, 0.8, 0.5, 0);
+    expect(result.saved).toBe(0);
+    expect(result.estimatedUnoptimized).toBe(800);
+  });
+});
+
+// TK3: Window pruning
+describe('pruneExpiredWindows (TK3)', () => {
+  function makeExpiredWindow(id: string): WindowEntry {
+    return {
+      id,
+      startedAt: '2025-01-01T00:00:00Z',
+      expiresAt: '2025-01-01T05:00:00Z',
+      windowDurationMs: 18_000_000,
+      tokensConsumed: 1000,
+      budget: 44000,
+      remaining: 43000,
+      tasksCompleted: 3,
+      timeRemainingMs: 0,
+      estimatedResetAt: '2025-01-01T05:00:00Z',
+    };
+  }
+
+  it('keeps active windows untouched', () => {
+    const active = createWindow([], 18_000_000, 44000);
+    const result = pruneExpiredWindows([active]);
+    expect(result.length).toBe(1);
+    expect(result[0].id).toBe(active.id);
+  });
+
+  it('retains up to MAX_RETAINED_WINDOWS expired windows', () => {
+    const expired = Array.from({ length: 15 }, (_, i) =>
+      makeExpiredWindow(`w_20250101_${String(i + 1).padStart(2, '0')}`),
+    );
+    const active = createWindow(expired, 18_000_000, 44000);
+
+    const result = pruneExpiredWindows([...expired, active]);
+    // 10 retained expired + 1 active = 11
+    expect(result.length).toBe(11);
+    // Active should be last
+    expect(result[result.length - 1].id).toBe(active.id);
+    // Most recent expired windows should be retained
+    expect(result[0].id).toBe('w_20250101_06');
+  });
+
+  it('keeps all expired if under limit', () => {
+    const expired = Array.from({ length: 3 }, (_, i) =>
+      makeExpiredWindow(`w_20250101_${String(i + 1).padStart(2, '0')}`),
+    );
+    const result = pruneExpiredWindows(expired);
+    expect(result.length).toBe(3);
+  });
+
+  it('handles empty array', () => {
+    expect(pruneExpiredWindows([]).length).toBe(0);
+  });
+});
+
+// TK12: Per-type session breakdown
+describe('per-type session stats (TK12)', () => {
+  let projectRoot: string;
+
+  beforeEach(() => {
+    projectRoot = createTestProject();
+    resetSession();
+  });
+
+  it('tracks per-type breakdown in session stats', () => {
+    trackUsage({
+      taskId: 'type-001',
+      tokensUsed: 500,
+      domain: 'general',
+      predictionConfidence: 0,
+      compressionRatio: 0,
+      projectRoot,
+      taskType: 'BugFix',
+    });
+    trackUsage({
+      taskId: 'type-002',
+      tokensUsed: 300,
+      domain: 'general',
+      predictionConfidence: 0,
+      compressionRatio: 0,
+      projectRoot,
+      taskType: 'Feature',
+    });
+    const result = trackUsage({
+      taskId: 'type-003',
+      tokensUsed: 200,
+      domain: 'general',
+      predictionConfidence: 0,
+      compressionRatio: 0,
+      projectRoot,
+      taskType: 'BugFix',
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+
+    const perType = result.value.sessionStats.perType;
+    expect(perType).toBeDefined();
+    expect(perType!['BugFix'].tasks).toBe(2);
+    expect(perType!['BugFix'].tokensConsumed).toBe(700);
+    expect(perType!['Feature'].tasks).toBe(1);
+    expect(perType!['Feature'].tokensConsumed).toBe(300);
+  });
+
+  it('omits perType when taskType not provided', () => {
+    const result = trackUsage({
+      taskId: 'no-type',
+      tokensUsed: 500,
+      domain: 'general',
+      predictionConfidence: 0,
+      compressionRatio: 0,
+      projectRoot,
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.sessionStats.perType).toBeUndefined();
   });
 });

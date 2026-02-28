@@ -3,7 +3,7 @@
  * Must complete in <10ms (NFR TT-10).
  */
 
-import type { Result, Metrics, DomainMetrics } from '../types/index.js';
+import type { Result, Metrics, DomainMetrics, UsageHistoryEntry, ModelTokenStats } from '../types/index.js';
 import { ok, logger } from '../utils/index.js';
 import { readMetrics, writeMetrics, readConfig, createDefaultMetrics } from '../store/index.js';
 import type {
@@ -15,6 +15,7 @@ import type {
   SavingsEstimate,
   TrackUsageInput,
 } from './types.js';
+import { MAX_USAGE_HISTORY, MAX_RETAINED_WINDOWS } from './types.js';
 
 const MODULE = 'tracker';
 
@@ -45,15 +46,18 @@ export function resetSession(): void {
 
 /**
  * Estimate token savings.
- * Formula: estimatedUnoptimized = tokensUsed / (1 - compressionRatio * predictionConfidence)
+ * Formula: estimatedUnoptimized = tokensUsed / (1 - compressionRatio * predictionConfidence * predictionAccuracy)
+ * When predictionAccuracy is unavailable, falls back to compressionRatio * predictionConfidence (TK4).
  * If no optimization occurred, estimatedUnoptimized = tokensUsed (no savings).
  */
 export function estimateSavings(
   tokensUsed: number,
   predictionConfidence: number,
   compressionRatio: number,
+  predictionAccuracy?: number,
 ): SavingsEstimate {
-  const optimizationFactor = compressionRatio * predictionConfidence;
+  const accuracyFactor = predictionAccuracy != null ? predictionAccuracy : 1;
+  const optimizationFactor = compressionRatio * predictionConfidence * accuracyFactor;
 
   let estimatedUnoptimized: number;
   if (optimizationFactor <= 0 || optimizationFactor >= 1) {
@@ -155,6 +159,31 @@ export function getWindowStatus(window: WindowEntry): WindowStatus {
   };
 }
 
+// ─── Window Pruning (TK3) ──────────────────────────────────────
+
+/**
+ * Prune expired windows, keeping the active window + last MAX_RETAINED_WINDOWS expired ones.
+ */
+export function pruneExpiredWindows(windows: WindowEntry[]): WindowEntry[] {
+  const active: WindowEntry[] = [];
+  const expired: WindowEntry[] = [];
+
+  for (const w of windows) {
+    if (isWindowExpired(w)) {
+      expired.push(w);
+    } else {
+      active.push(w);
+    }
+  }
+
+  // Keep only the most recent expired windows
+  const retainedExpired = expired.length > MAX_RETAINED_WINDOWS
+    ? expired.slice(expired.length - MAX_RETAINED_WINDOWS)
+    : expired;
+
+  return [...retainedExpired, ...active];
+}
+
 // ─── Domain Aggregation ────────────────────────────────────────
 
 function updateDomainStats(
@@ -177,33 +206,50 @@ function updateDomainStats(
   perDomain[domain] = existing;
 }
 
+// ─── Per-Model Aggregation (TK6) ──────────────────────────────
+
+function updateModelStats(
+  perModel: Record<string, ModelTokenStats>,
+  modelTier: string,
+  tokensUsed: number,
+  tokensSaved: number,
+): void {
+  const existing = perModel[modelTier] ?? {
+    totalTasks: 0,
+    totalTokensConsumed: 0,
+    totalTokensSaved: 0,
+  };
+
+  existing.totalTasks += 1;
+  existing.totalTokensConsumed += tokensUsed;
+  existing.totalTokensSaved += tokensSaved;
+  perModel[modelTier] = existing;
+}
+
 // ─── Core: trackUsage ──────────────────────────────────────────
 
 /**
  * Record token usage for a completed task.
- * Updates metrics.json with per-task, per-session, per-window, and per-domain data.
+ * Updates metrics.json with per-task, per-session, per-window, per-domain, and per-model data.
  * Must complete in <10ms overhead.
  */
 export function trackUsage(input: TrackUsageInput): Result<TrackingResult> {
   const startTime = performance.now();
 
-  // Read current metrics (or create default if missing)
-  const metricsResult = readMetrics(input.projectRoot);
-  let metrics: Metrics;
-  if (!metricsResult.ok) {
-    logger.debug(MODULE, 'No metrics found, using defaults');
-    metrics = createDefaultMetrics();
-  } else {
-    metrics = metricsResult.ok ? metricsResult.value : createDefaultMetrics();
-  }
+  // TK1: Use StoreCache when available, fall back to disk reads
+  const cache = input.storeCache;
 
-  // Read config for budget/window settings
-  const configResult = readConfig(input.projectRoot);
-  const tokenBudget = configResult.ok ? configResult.value.tokenBudget : 44000;
-  const windowDurationMs = configResult.ok ? configResult.value.windowDurationMs : 18_000_000;
+  // TK5: Simplified metrics read (fixed redundant check)
+  const metrics: Metrics = cache?.metrics
+    ?? (readMetrics(input.projectRoot).ok ? (readMetrics(input.projectRoot) as { ok: true; value: Metrics }).value : createDefaultMetrics());
 
-  // Calculate savings
-  const savings = estimateSavings(input.tokensUsed, input.predictionConfidence, input.compressionRatio);
+  // Read config for budget/window settings (TK1: prefer cache)
+  const config = cache?.config;
+  const tokenBudget = config?.tokenBudget ?? 44000;
+  const windowDurationMs = config?.windowDurationMs ?? 18_000_000;
+
+  // TK4: Calculate savings with optional prediction accuracy
+  const savings = estimateSavings(input.tokensUsed, input.predictionConfidence, input.compressionRatio, input.predictionAccuracy);
 
   // Create per-task usage record
   const usage: TokenUsage = {
@@ -215,8 +261,9 @@ export function trackUsage(input: TrackUsageInput): Result<TrackingResult> {
     timestamp: new Date().toISOString(),
   };
 
-  // Update window
-  const windows = (metrics.windows as unknown as WindowEntry[]) ?? [];
+  // TK3: Prune expired windows before operating
+  let windows = pruneExpiredWindows((metrics.windows as unknown as WindowEntry[]) ?? []);
+
   let activeWindow = getActiveWindow(windows);
   if (!activeWindow) {
     activeWindow = createWindow(windows, windowDurationMs, tokenBudget);
@@ -240,6 +287,27 @@ export function trackUsage(input: TrackUsageInput): Result<TrackingResult> {
   // Update per-domain
   updateDomainStats(metrics.perDomain, input.domain, input.tokensUsed, savings.saved);
 
+  // TK6: Update per-model stats
+  if (input.modelTier) {
+    if (!metrics.perModel) metrics.perModel = {};
+    updateModelStats(metrics.perModel, input.modelTier, input.tokensUsed, savings.saved);
+  }
+
+  // TK2: Append to usage history (FIFO, capped)
+  if (!metrics.recentUsage) metrics.recentUsage = [];
+  const historyEntry: UsageHistoryEntry = {
+    taskId: input.taskId,
+    tokensUsed: input.tokensUsed,
+    savings: savings.saved,
+    domain: input.domain,
+    modelTier: input.modelTier,
+    timestamp: usage.timestamp,
+  };
+  metrics.recentUsage.push(historyEntry);
+  if (metrics.recentUsage.length > MAX_USAGE_HISTORY) {
+    metrics.recentUsage = metrics.recentUsage.slice(metrics.recentUsage.length - MAX_USAGE_HISTORY);
+  }
+
   // Replace windows in metrics (cast back to store format)
   metrics.windows = windows as unknown as typeof metrics.windows;
 
@@ -253,6 +321,16 @@ export function trackUsage(input: TrackUsageInput): Result<TrackingResult> {
   currentSession.tasksCompleted += 1;
   currentSession.tokensConsumed += input.tokensUsed;
   currentSession.tokensSaved += savings.saved;
+
+  // TK12: Update per-type session breakdown
+  if (input.taskType) {
+    if (!currentSession.perType) currentSession.perType = {};
+    const typeStats = currentSession.perType[input.taskType] ?? { tasks: 0, tokensConsumed: 0, tokensSaved: 0 };
+    typeStats.tasks += 1;
+    typeStats.tokensConsumed += input.tokensUsed;
+    typeStats.tokensSaved += savings.saved;
+    currentSession.perType[input.taskType] = typeStats;
+  }
 
   const windowStatus = getWindowStatus(activeWindow);
 
