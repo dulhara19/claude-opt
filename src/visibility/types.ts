@@ -153,7 +153,8 @@ export type QuickReason = 'missed-files' | 'wrong-files' | 'wrong-model';
 
 export interface InlineFeedback {
   source: 'inline';
-  rating: 'good' | 'bad';
+  /** FB10: 'partial' for mostly-correct results. */
+  rating: 'good' | 'bad' | 'partial';
   quickReason?: QuickReason;
 }
 
@@ -189,6 +190,23 @@ export interface CorrectionContext {
 }
 
 export type FeedbackResult = InlineFeedback | InlineFeedbackWithDescription | DetailedFeedback | null;
+
+/** Aggregated feedback analytics (FB7). */
+export interface FeedbackAnalytics {
+  totalFeedbacks: number;
+  good: number;
+  bad: number;
+  partial: number;
+  skipped: number;
+  /** Breakdown of bad feedback by quickReason. */
+  reasonBreakdown: Record<string, number>;
+  /** Top files that were reported as missed. */
+  topMissedFiles: Array<{ file: string; count: number }>;
+  /** Model correction trend. */
+  modelCorrections: { tooWeak: number; tooStrong: number };
+  /** Good-to-bad ratio (higher is better). */
+  satisfactionRate: number;
+}
 
 export interface ForgetResult {
   filePath: string;

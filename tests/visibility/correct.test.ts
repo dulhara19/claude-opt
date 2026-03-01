@@ -21,6 +21,8 @@ const storeMock = vi.hoisted(() => ({
   readPatterns: vi.fn(),
   writePatterns: vi.fn(),
   readProjectMap: vi.fn(),
+  readMetrics: vi.fn(),
+  writeMetrics: vi.fn(),
 }));
 
 vi.mock('../../src/store/index.js', () => storeMock);
@@ -266,7 +268,8 @@ describe('applyDetailedCorrection', () => {
     expect(affinity.fileWeights!['src/config.ts'].weight).toBe(0.5); // 0.3 (default) + 0.2
     expect(affinity.fileWeights!['src/config.ts'].occurrences).toBe(1);
     expect(affinity.files).toContain('src/config.ts');
-    expect(storeMock.writePatterns).toHaveBeenCalledOnce();
+    // FB9: writePatterns called twice — once for weight correction, once for co-occurrence boost
+    expect(storeMock.writePatterns).toHaveBeenCalled();
   });
 
   it('decays wrong files in patterns.json typeAffinities', () => {
@@ -353,6 +356,9 @@ describe('applyDetailedCorrection', () => {
     storeMock.writePatterns.mockReturnValue({ ok: true, value: undefined });
     storeMock.readTaskHistory.mockReturnValue({ ok: true, value: history });
     storeMock.writeTaskHistory.mockReturnValue({ ok: true, value: undefined });
+    // FB8: Metrics mock for model correction integration
+    storeMock.readMetrics.mockReturnValue({ ok: true, value: { overall: {}, modelPerformance: {} } });
+    storeMock.writeMetrics.mockReturnValue({ ok: true, value: undefined });
 
     const feedback: DetailedFeedback = {
       source: 'cli-correct',
@@ -470,6 +476,8 @@ describe('Correction edge cases', () => {
     storeMock.writePatterns.mockReturnValue({ ok: true, value: undefined });
     storeMock.readTaskHistory.mockReturnValue({ ok: true, value: history });
     storeMock.writeTaskHistory.mockReturnValue({ ok: true, value: undefined });
+    storeMock.readMetrics.mockReturnValue({ ok: true, value: { overall: {}, modelPerformance: {} } });
+    storeMock.writeMetrics.mockReturnValue({ ok: true, value: undefined });
 
     const feedback: DetailedFeedback = {
       source: 'cli-correct',
@@ -493,10 +501,11 @@ describe('Correction edge cases', () => {
     const result = applyDetailedCorrection(feedback, ctx, '/proj');
     expect(result.ok).toBe(true);
 
-    // Missed file boosted
-    expect(patterns.typeAffinities.feature.fileWeights!['src/missed.ts'].weight).toBe(0.5);
-    // Wrong file decayed
-    expect(patterns.typeAffinities.feature.fileWeights!['src/wrong.ts'].weight).toBeCloseTo(0.5, 10);
+    // FB5: Adaptive weights with precision=0, recall=0 → scale=0.5 → boost=0.1, decay=0.1
+    // Missed file boosted: 0.3 + 0.1 = 0.4
+    expect(patterns.typeAffinities.feature.fileWeights!['src/missed.ts'].weight).toBeCloseTo(0.4, 2);
+    // Wrong file decayed: 0.7 - 0.1 = 0.6
+    expect(patterns.typeAffinities.feature.fileWeights!['src/wrong.ts'].weight).toBeCloseTo(0.6, 2);
     // Routing updated
     expect(history.tasks[0].routing.reason).toContain('too-strong');
   });

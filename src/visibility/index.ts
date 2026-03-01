@@ -20,6 +20,9 @@ export {
   loadCorrectionContext, displayCorrectionContext, showCorrectionMenu,
   promptFilePaths, promptModelCorrection, promptDescription,
   applyDetailedCorrection, runCorrectCommand,
+  validateFeedback, adaptiveWeightAmount,
+  aggregateFeedback, applyModelCorrectionToMetrics, boostCoOccurrenceFromFeedback,
+  DEFAULT_FEEDBACK_TIMEOUT_MS,
 } from './feedback.js';
 export {
   drawBox,
@@ -59,6 +62,7 @@ export type {
   FeedbackResult,
   ForgetResult,
   TaskSummary,
+  FeedbackAnalytics,
 } from './types.js';
 
 /**
