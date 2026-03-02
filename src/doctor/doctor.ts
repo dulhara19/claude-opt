@@ -32,12 +32,16 @@ import {
   MIN_TASKS_FOR_STALENESS,
   DEFAULT_STALENESS_WINDOW,
   STALENESS_WEIGHT_THRESHOLD,
+  STALENESS_DECAY_BASE,
   COOCCURRENCE_MIN_RATIO,
   MIN_PREDICTIONS_FOR_BAD,
   BAD_PREDICTION_HIT_THRESHOLD,
   SEVERITY_DEDUCTIONS,
   DEEP_ANALYSIS_BASE_TOKENS,
   DEEP_ANALYSIS_TOKENS_PER_100,
+  CROSS_DOMAIN_MIN_RATIO,
+  DECLINING_ACCURACY_DROP,
+  TREND_WINDOW_SIZE,
 } from './types.js';
 
 const MODULE = 'doctor:diagnostics';
@@ -46,6 +50,8 @@ const MODULE = 'doctor:diagnostics';
 
 /**
  * Detect patterns with high weight that are no longer appearing in recent tasks.
+ * Uses exponential decay scoring (D1): staleness = 1 - STALENESS_DECAY_BASE^tasksSinceLastSeen.
+ * Severity thresholds: >0.7 decay = critical, >0.4 = medium, else low.
  */
 export function detectStalePatterns(
   patterns: Patterns,
@@ -75,13 +81,18 @@ export function detectStalePatterns(
 
     for (const file of affinity.files) {
       if (!recentFiles.has(file)) {
-        // Determine severity based on how long it's been missing
+        // D1: Temporal decay scoring
         const lastSeenIdx = findLastTaskWithFile(tasks, file);
         const tasksSinceLastSeen = lastSeenIdx === -1 ? tasks.length : tasks.length - 1 - lastSeenIdx;
-        const severity: FindingSeverity = tasksSinceLastSeen >= 10 ? 'critical' : 'medium';
+        const decayScore = 1 - Math.pow(STALENESS_DECAY_BASE, tasksSinceLastSeen);
+
+        // Severity from continuous decay score
+        const severity: FindingSeverity =
+          decayScore >= 0.7 ? 'critical' :
+          decayScore >= 0.4 ? 'medium' : 'low';
 
         const description = `Pattern for "${taskType}" references "${file}" but it hasn't appeared in recent tasks`;
-        const evidence = `weight ${affinity.confidence.toFixed(2)}, unused in last ${recentTasks.length} tasks` +
+        const evidence = `weight ${affinity.confidence.toFixed(2)}, unused in last ${recentTasks.length} tasks, decay ${decayScore.toFixed(2)}` +
           (lastSeenIdx >= 0 ? `, last seen in task ${tasks[lastSeenIdx].id}` : ', never seen in history');
 
         const finding: DiagnosticFinding = {
@@ -94,7 +105,7 @@ export function detectStalePatterns(
           affectedFiles: [file],
           affectedDomain: getDomainForFile(file, taskHistory),
           evidence,
-          recommendation: tasksSinceLastSeen >= 10
+          recommendation: decayScore >= 0.7
             ? 'Remove from active predictions'
             : 'Reduce weight',
         };
@@ -238,6 +249,166 @@ export function detectBadPredictions(
   return findings;
 }
 
+// ─── Declining accuracy trend detection (D3) ─────────────────────
+
+/**
+ * Detect domains where accuracy is declining over recent tasks,
+ * even if still above the threshold. Alerts early when accuracy
+ * drops >DECLINING_ACCURACY_DROP over the last TREND_WINDOW_SIZE tasks.
+ */
+export function detectDecliningAccuracy(
+  taskHistory: TaskHistory,
+  metrics: Metrics,
+): DiagnosticFinding[] {
+  const findings: DiagnosticFinding[] = [];
+  const tasks = taskHistory.tasks;
+
+  if (tasks.length < TREND_WINDOW_SIZE * 2) {
+    return findings; // Need enough tasks to compare two windows
+  }
+
+  // Group tasks by domain (classification.taskType)
+  const domainTasks = new Map<string, typeof tasks>();
+  for (const task of tasks) {
+    const domain = task.classification.taskType;
+    if (!domainTasks.has(domain)) domainTasks.set(domain, []);
+    domainTasks.get(domain)!.push(task);
+  }
+
+  let index = 0;
+  for (const [domain, dTasks] of domainTasks) {
+    if (dTasks.length < TREND_WINDOW_SIZE * 2) continue;
+
+    // Compare recent window vs previous window
+    const recentWindow = dTasks.slice(-TREND_WINDOW_SIZE);
+    const previousWindow = dTasks.slice(-TREND_WINDOW_SIZE * 2, -TREND_WINDOW_SIZE);
+
+    const recentAvg = avgPrecisionRecall(recentWindow);
+    const previousAvg = avgPrecisionRecall(previousWindow);
+    const drop = previousAvg - recentAvg;
+
+    if (drop >= DECLINING_ACCURACY_DROP) {
+      findings.push({
+        id: `f_decline_${String(index).padStart(3, '0')}`,
+        type: 'declining-accuracy',
+        severity: 'info',
+        description: `Accuracy in "${domain}" is declining: ${Math.round(previousAvg * 100)}% → ${Math.round(recentAvg * 100)}% over last ${TREND_WINDOW_SIZE * 2} tasks`,
+        affectedFiles: [],
+        affectedDomain: domain,
+        evidence: `drop of ${Math.round(drop * 100)}% (previous ${TREND_WINDOW_SIZE}: ${Math.round(previousAvg * 100)}%, recent ${TREND_WINDOW_SIZE}: ${Math.round(recentAvg * 100)}%)`,
+        recommendation: 'Monitor closely — may need intervention soon',
+      });
+      index++;
+    }
+  }
+
+  return findings;
+}
+
+// ─── Cross-domain pattern detection (D4) ─────────────────────────
+
+/**
+ * Detect domain pairs that consistently appear together in tasks.
+ * Flags when tasks touching domain A also touch domain B in >=CROSS_DOMAIN_MIN_RATIO of cases.
+ */
+export function detectCrossDomainDependencies(
+  taskHistory: TaskHistory,
+): DiagnosticFinding[] {
+  const findings: DiagnosticFinding[] = [];
+  const tasks = taskHistory.tasks;
+
+  if (tasks.length < MIN_TASKS_FOR_PATTERN_DETECTION) {
+    return findings;
+  }
+
+  // Build per-task domain sets from actualFiles
+  const taskDomains: Set<string>[] = [];
+  const domainCounts = new Map<string, number>();
+
+  for (const task of tasks) {
+    const domains = new Set<string>();
+    for (const file of task.prediction.actualFiles) {
+      const domain = extractDomainFromPath(file);
+      if (domain) domains.add(domain);
+    }
+    taskDomains.push(domains);
+    for (const d of domains) {
+      domainCounts.set(d, (domainCounts.get(d) ?? 0) + 1);
+    }
+  }
+
+  // Count domain pair co-occurrences
+  const pairCounts = new Map<string, number>();
+  for (const domains of taskDomains) {
+    const domainArray = [...domains];
+    for (let i = 0; i < domainArray.length; i++) {
+      for (let j = i + 1; j < domainArray.length; j++) {
+        const key = makePairKey(domainArray[i], domainArray[j]);
+        pairCounts.set(key, (pairCounts.get(key) ?? 0) + 1);
+      }
+    }
+  }
+
+  let index = 0;
+  for (const [key, count] of pairCounts) {
+    const [domainA, domainB] = key.split('|||');
+    const countA = domainCounts.get(domainA) ?? 0;
+    const countB = domainCounts.get(domainB) ?? 0;
+    const minCount = Math.min(countA, countB);
+
+    // Ratio relative to the less-frequent domain
+    if (minCount < MIN_TASKS_FOR_PATTERN_DETECTION) continue;
+    const ratio = count / minCount;
+
+    if (ratio >= CROSS_DOMAIN_MIN_RATIO) {
+      findings.push({
+        id: `f_crossdom_${String(index).padStart(3, '0')}`,
+        type: 'cross-domain-dependency',
+        severity: 'info',
+        description: `Domains "${domainA}" and "${domainB}" frequently co-occur in tasks`,
+        affectedFiles: [],
+        affectedDomain: domainA,
+        evidence: `co-occurred in ${count} tasks (${Math.round(ratio * 100)}% of "${domainA < domainB ? domainB : domainA}" tasks)`,
+        recommendation: `Consider cross-domain prediction boost for ${domainA} ↔ ${domainB}`,
+      });
+      index++;
+    }
+  }
+
+  return findings;
+}
+
+// ─── Thin domain detection (D10) ─────────────────────────────────
+
+/**
+ * Detect domains with too few tasks for reliable accuracy (D10).
+ * Flags domains with < MIN_TASKS_FOR_PATTERN_DETECTION tasks as 'info' severity.
+ */
+export function detectThinDomains(
+  metrics: Metrics,
+): DiagnosticFinding[] {
+  const findings: DiagnosticFinding[] = [];
+  let index = 0;
+
+  for (const [domain, dm] of Object.entries(metrics.perDomain)) {
+    if (dm.totalTasks < MIN_TASKS_FOR_PATTERN_DETECTION && dm.totalTasks > 0) {
+      findings.push({
+        id: `f_thin_${String(index).padStart(3, '0')}`,
+        type: 'thin-domain',
+        severity: 'info',
+        description: `Domain "${domain}" has only ${dm.totalTasks} task${dm.totalTasks === 1 ? '' : 's'} — accuracy metrics are unreliable`,
+        affectedFiles: [],
+        affectedDomain: domain,
+        evidence: `${dm.totalTasks} tasks (need ${MIN_TASKS_FOR_PATTERN_DETECTION}+ for reliable patterns)`,
+        recommendation: `Collect more data — ${MIN_TASKS_FOR_PATTERN_DETECTION - dm.totalTasks} more tasks needed`,
+      });
+      index++;
+    }
+  }
+
+  return findings;
+}
+
 // ─── Health score calculation (Task 5) ───────────────────────────
 
 /**
@@ -348,13 +519,16 @@ export async function runDiagnostics(
         patterns = filterPatternsByDomain(patterns, options.domain);
       }
 
-      // Run all three detectors
+      // Run all six detectors
       const staleFindings = detectStalePatterns(patterns, taskHistory, metrics);
       const cooccurrenceFindings = detectMissingCooccurrences(taskHistory, patterns);
       const badPredictionFindings = detectBadPredictions(taskHistory, metrics);
+      const decliningFindings = detectDecliningAccuracy(taskHistory, metrics);
+      const crossDomainFindings = detectCrossDomainDependencies(taskHistory);
+      const thinDomainFindings = detectThinDomains(metrics);
 
       // Combine and sort by severity
-      const allFindings = [...staleFindings, ...cooccurrenceFindings, ...badPredictionFindings];
+      const allFindings = [...staleFindings, ...cooccurrenceFindings, ...badPredictionFindings, ...decliningFindings, ...crossDomainFindings, ...thinDomainFindings];
       allFindings.sort((a, b) => severityOrder(a.severity) - severityOrder(b.severity));
 
       // Calculate health score
@@ -533,6 +707,34 @@ function severityIcon(severity: FindingSeverity): string {
     case 'info': return chalk.blue('\u2139');
     default: return ' ';
   }
+}
+
+/**
+ * Average of (precision + recall) / 2 across tasks in a window (D3).
+ */
+function avgPrecisionRecall(tasks: TaskHistory['tasks']): number {
+  if (tasks.length === 0) return 0;
+  let sum = 0;
+  for (const task of tasks) {
+    sum += (task.prediction.precision + task.prediction.recall) / 2;
+  }
+  return sum / tasks.length;
+}
+
+/**
+ * Extract domain from file path — first meaningful directory segment (D4).
+ * e.g. "src/doctor/types.ts" → "doctor", "src/utils/index.ts" → "utils"
+ */
+function extractDomainFromPath(filePath: string): string | null {
+  const parts = filePath.replace(/\\/g, '/').split('/');
+  // Skip common root dirs like src/, lib/, app/
+  const skipDirs = new Set(['src', 'lib', 'app', 'dist', 'build', 'test', 'tests', '.']);
+  for (const part of parts) {
+    if (!skipDirs.has(part) && !part.includes('.')) {
+      return part;
+    }
+  }
+  return null;
 }
 
 function filterTaskHistoryByDomain(taskHistory: TaskHistory, domain: string): TaskHistory {

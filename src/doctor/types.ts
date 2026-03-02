@@ -60,7 +60,9 @@ export type FindingType =
   | 'stale-pattern'
   | 'missing-cooccurrence'
   | 'bad-prediction'
-  | 'thin-domain';
+  | 'thin-domain'
+  | 'declining-accuracy'
+  | 'cross-domain-dependency';
 
 /** Severity levels for doctor findings. */
 export type FindingSeverity = 'critical' | 'medium' | 'low' | 'info';
@@ -101,6 +103,8 @@ export interface DiagnosticOptions {
   domain?: string;
   reportOnly?: boolean;
   deep?: boolean;
+  /** Per-domain last-run timestamps for incremental diagnostics (D5). */
+  lastRunTimestamps?: Record<string, string>;
 }
 
 /** Health score with overall and per-domain breakdown. */
@@ -170,6 +174,18 @@ export const MIN_PREDICTIONS_FOR_BAD = 3;
 /** Hit rate below which a prediction is considered bad. */
 export const BAD_PREDICTION_HIT_THRESHOLD = 0.2;
 
+/** Staleness decay base — severity = 1 - STALENESS_DECAY_BASE^tasksSinceLastSeen (D1). */
+export const STALENESS_DECAY_BASE = 0.9;
+
+/** Cross-domain co-occurrence ratio threshold (D4). */
+export const CROSS_DOMAIN_MIN_RATIO = 0.7;
+
+/** Minimum accuracy drop to trigger declining-accuracy alert (D3). */
+export const DECLINING_ACCURACY_DROP = 0.10;
+
+/** Number of recent tasks to measure accuracy trend (D3). */
+export const TREND_WINDOW_SIZE = 5;
+
 /** Score deductions per finding severity. */
 export const SEVERITY_DEDUCTIONS: Record<FindingSeverity, number> = {
   critical: 0.15,
@@ -186,6 +202,10 @@ export interface ThresholdAlert {
   currentAccuracy: number;
   threshold: number;
   timestamp: string;
+  /** Current precision for the domain (D2). */
+  currentPrecision?: number;
+  /** Current recall for the domain (D2). */
+  currentRecall?: number;
 }
 
 /** User choice after seeing a threshold alert. */
@@ -201,6 +221,8 @@ export interface FixProposal {
   action: FixAction;
   explanation: string;
   riskLevel: 'low' | 'medium' | 'high';
+  /** Confidence score for proposal priority ordering (D7). Range 0-1. */
+  confidence?: number;
 }
 
 /** Result of applying (or skipping) a fix. */
@@ -211,6 +233,8 @@ export interface FixResult {
   result: string;
   before?: unknown;
   after?: unknown;
+  /** Whether fix was verified as effective (D6). */
+  verified?: 'effective' | 'ineffective' | 'unverified';
 }
 
 /** A complete supervised mode session for one alert. */
@@ -262,6 +286,45 @@ export interface AuditAction {
 
 /** Risk levels that autonomous mode auto-applies. */
 export const AUTO_APPLY_RISK_LEVELS: readonly string[] = ['low'];
+
+/** Maximum entries in doctor-log before rotation (D11). */
+export const MAX_DOCTOR_LOG_ENTRIES = 100;
+
+/** Default cooldown tasks before re-alerting same domain (D9). */
+export const DEFAULT_COOLDOWN_TASKS = 10;
+
+/** Default cooldown duration in ms (24 hours) (D9). */
+export const DEFAULT_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+
+/** Per-domain cooldown state (D9). */
+export interface DomainCooldown {
+  domain: string;
+  dismissedAt: string;
+  cooldownUntil: string;
+  taskCountAtDismissal: number;
+}
+
+/** Doctor override entry to protect fixes from learner re-learning (D12). */
+export interface DoctorOverride {
+  domain: string;
+  field: string;
+  value: number;
+  appliedAt: string;
+  gracePeriodTasks: number;
+  taskCountAtApplication: number;
+}
+
+/** Default grace period for doctor overrides (D12). */
+export const DEFAULT_OVERRIDE_GRACE_PERIOD = 10;
+
+/** Summary of doctor history trends (D11). */
+export interface DoctorHistorySummary {
+  totalSessions: number;
+  totalFixesApplied: number;
+  totalFixesSkipped: number;
+  recurringIssues: { type: string; count: number }[];
+  domainAttention: { domain: string; sessions: number }[];
+}
 
 /** Deep analysis base token cost. */
 export const DEEP_ANALYSIS_BASE_TOKENS = 800;
