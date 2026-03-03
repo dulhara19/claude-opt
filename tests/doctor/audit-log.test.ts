@@ -10,7 +10,10 @@ import {
   buildLogEntry,
   writeDoctorLogEntry,
   mapFixResultsToAuditActions,
+  getLastRunTimestamps,
+  summarizeDoctorHistory,
 } from '../../src/doctor/audit-log.js';
+import { MAX_DOCTOR_LOG_ENTRIES } from '../../src/doctor/types.js';
 import type {
   DiagnosticFinding,
   FixResult,
@@ -325,6 +328,93 @@ describe('mapFixResultsToAuditActions', () => {
   });
 });
 
+// ─── D5: Last run timestamps ──────────────────────────────────────
+
+describe('getLastRunTimestamps (D5)', () => {
+  it('returns empty object when no entries exist', () => {
+    const timestamps = getLastRunTimestamps(projectRoot);
+    expect(Object.keys(timestamps).length).toBe(0);
+  });
+
+  it('returns timestamps after writing entries', () => {
+    const entry = buildLogEntry({
+      mode: 'supervised',
+      trigger: 'threshold-breach',
+      triggerDetail: 'test',
+      usedArchive: false,
+      findings: [{
+        id: 'f1',
+        type: 'stale-pattern',
+        severity: 'medium',
+        description: 'test',
+        affectedFiles: ['src/foo.ts'],
+        affectedDomain: 'test',
+        evidence: 'test',
+        recommendation: 'test',
+      }],
+      fixResults: [],
+      healthBefore: 0.5,
+      healthAfter: 0.5,
+      tokensCost: 0,
+    });
+    writeDoctorLogEntry(projectRoot, entry);
+
+    const timestamps = getLastRunTimestamps(projectRoot);
+    expect(timestamps['__overall__']).toBeDefined();
+  });
+
+  it('returns most recent timestamp per domain', () => {
+    const entry1 = buildLogEntry({
+      mode: 'supervised',
+      trigger: 'manual',
+      triggerDetail: 'first',
+      usedArchive: false,
+      findings: [{
+        id: 'f1',
+        type: 'stale-pattern',
+        severity: 'medium',
+        description: 'test',
+        affectedFiles: ['src/foo.ts'],
+        affectedDomain: 'test',
+        evidence: 'test',
+        recommendation: 'test',
+      }],
+      fixResults: [],
+      healthBefore: 0.5,
+      healthAfter: 0.5,
+      tokensCost: 0,
+    });
+    writeDoctorLogEntry(projectRoot, entry1);
+
+    const entry2 = buildLogEntry({
+      mode: 'supervised',
+      trigger: 'manual',
+      triggerDetail: 'second',
+      usedArchive: false,
+      findings: [{
+        id: 'f2',
+        type: 'stale-pattern',
+        severity: 'medium',
+        description: 'test2',
+        affectedFiles: ['src/bar.ts'],
+        affectedDomain: 'test2',
+        evidence: 'test2',
+        recommendation: 'test2',
+      }],
+      fixResults: [],
+      healthBefore: 0.6,
+      healthAfter: 0.6,
+      tokensCost: 0,
+      existingEntries: [{ id: entry1.id }],
+    });
+    writeDoctorLogEntry(projectRoot, entry2);
+
+    const timestamps = getLastRunTimestamps(projectRoot);
+    // Should have overall timestamp from the latest entry
+    expect(timestamps['__overall__']).toBe(entry2.timestamp);
+  });
+});
+
 // ─── Deep analysis ────────────────────────────────────────────────
 
 describe('deep analysis metadata', () => {
@@ -359,6 +449,147 @@ describe('deep analysis prompt rendering', () => {
     expect(output).toContain('Proceed with deep analysis');
     expect(output).toContain('Standard analysis only');
     expect(output).toContain('Cancel');
+  });
+});
+
+// ─── D11: Log rotation ──────────────────────────────────────────
+
+describe('writeDoctorLogEntry — rotation (D11)', () => {
+  it('rotates entries when exceeding MAX_DOCTOR_LOG_ENTRIES', () => {
+    // Write MAX + 5 entries
+    const total = MAX_DOCTOR_LOG_ENTRIES + 5;
+    for (let i = 0; i < total; i++) {
+      const entry = buildLogEntry({
+        mode: 'supervised',
+        trigger: 'manual',
+        triggerDetail: `entry-${i}`,
+        usedArchive: false,
+        findings: [],
+        fixResults: [],
+        healthBefore: 0.5,
+        healthAfter: 0.5,
+        tokensCost: 0,
+      });
+      // Override ID to make them unique
+      entry.id = `doc_20260311_${String(i + 1).padStart(3, '0')}`;
+      writeDoctorLogEntry(projectRoot, entry);
+    }
+
+    const logResult = readDoctorLog(projectRoot);
+    expect(logResult.ok).toBe(true);
+    if (logResult.ok) {
+      expect(logResult.value.entries.length).toBe(MAX_DOCTOR_LOG_ENTRIES);
+      // Oldest entries should have been trimmed — first entry should be entry #5
+      expect(logResult.value.entries[0].id).toBe('doc_20260311_006');
+    }
+  });
+});
+
+// ─── D11: History summary ───────────────────────────────────────
+
+describe('summarizeDoctorHistory (D11)', () => {
+  it('returns empty summary when no entries exist', () => {
+    const result = summarizeDoctorHistory(projectRoot);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value.totalSessions).toBe(0);
+      expect(result.value.totalFixesApplied).toBe(0);
+      expect(result.value.totalFixesSkipped).toBe(0);
+      expect(result.value.recurringIssues).toHaveLength(0);
+      expect(result.value.domainAttention).toHaveLength(0);
+    }
+  });
+
+  it('summarizes fixes applied and skipped', () => {
+    const entry = buildLogEntry({
+      mode: 'supervised',
+      trigger: 'manual',
+      triggerDetail: 'test',
+      usedArchive: false,
+      findings: [{
+        id: 'f1',
+        type: 'stale-pattern',
+        severity: 'medium',
+        description: 'stale',
+        affectedFiles: ['src/a.ts'],
+        affectedDomain: 'core',
+        evidence: 'test',
+        recommendation: 'test',
+      }],
+      fixResults: [
+        {
+          proposal: {
+            findingId: 'f1',
+            finding: { id: 'f1', type: 'stale-pattern', severity: 'medium', description: '', affectedFiles: ['src/a.ts'], affectedDomain: 'core', evidence: '', recommendation: '' },
+            action: 'remove-stale',
+            explanation: '',
+            riskLevel: 'low',
+          },
+          applied: true,
+          approvedBy: 'user',
+          result: 'Done',
+        },
+        {
+          proposal: {
+            findingId: 'f2',
+            finding: { id: 'f2', type: 'bad-prediction', severity: 'low', description: '', affectedFiles: [], affectedDomain: 'core', evidence: '', recommendation: '' },
+            action: 'reduce-weight',
+            explanation: '',
+            riskLevel: 'medium',
+          },
+          applied: false,
+          approvedBy: 'user',
+          result: 'Skipped',
+        },
+      ],
+      healthBefore: 0.6,
+      healthAfter: 0.7,
+      tokensCost: 100,
+    });
+    writeDoctorLogEntry(projectRoot, entry);
+
+    const result = summarizeDoctorHistory(projectRoot);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value.totalSessions).toBe(1);
+      expect(result.value.totalFixesApplied).toBe(1);
+      expect(result.value.totalFixesSkipped).toBe(1);
+      expect(result.value.recurringIssues.length).toBeGreaterThan(0);
+      expect(result.value.recurringIssues[0].type).toBe('stale-pattern');
+    }
+  });
+
+  it('tracks recurring issues sorted by frequency', () => {
+    // Write 2 entries with different finding types
+    for (let i = 0; i < 3; i++) {
+      const entry = buildLogEntry({
+        mode: 'autonomous',
+        trigger: 'scheduled',
+        triggerDetail: `batch-${i}`,
+        usedArchive: false,
+        findings: [
+          { id: `f_stale_${i}`, type: 'stale-pattern', severity: 'medium', description: 'stale', affectedFiles: ['src/x.ts'], affectedDomain: 'core', evidence: '', recommendation: '' },
+          ...(i < 2 ? [{ id: `f_bad_${i}`, type: 'bad-prediction' as const, severity: 'low' as const, description: 'bad', affectedFiles: ['src/y.ts'], affectedDomain: 'core', evidence: '', recommendation: '' }] : []),
+        ],
+        fixResults: [],
+        healthBefore: 0.5,
+        healthAfter: 0.5,
+        tokensCost: 0,
+      });
+      entry.id = `doc_20260311_${String(i + 1).padStart(3, '0')}`;
+      writeDoctorLogEntry(projectRoot, entry);
+    }
+
+    const result = summarizeDoctorHistory(projectRoot);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value.totalSessions).toBe(3);
+      // stale-pattern appears 3 times, bad-prediction 2 times
+      expect(result.value.recurringIssues[0].type).toBe('stale-pattern');
+      expect(result.value.recurringIssues[0].count).toBe(3);
+      expect(result.value.recurringIssues[1].type).toBe('bad-prediction');
+      expect(result.value.recurringIssues[1].count).toBe(2);
+    }
   });
 });
 

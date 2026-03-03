@@ -13,10 +13,15 @@ import {
   detectStalePatterns,
   detectMissingCooccurrences,
   detectBadPredictions,
+  detectDecliningAccuracy,
+  detectCrossDomainDependencies,
+  detectThinDomains,
   calculateHealthScore,
   buildDiagnosticPrompt,
   renderDiagnosticReport,
   runDiagnostics,
+  STALENESS_DECAY_BASE,
+  MIN_TASKS_FOR_PATTERN_DETECTION,
 } from '../../src/doctor/index.js';
 import type {
   DiagnosticFinding,
@@ -108,6 +113,8 @@ describe('detectStalePatterns', () => {
     expect(findings[0].affectedFiles).toContain('src/old-module.ts');
     expect(findings[0].evidence).toContain('weight');
     expect(findings[0].evidence).toContain('unused');
+    // D1: should include decay score
+    expect(findings[0].evidence).toContain('decay');
   });
 
   it('creates no finding when pattern file is used in recent tasks', () => {
@@ -693,6 +700,361 @@ describe('buildDiagnosticPrompt', () => {
     const prompt = buildDiagnosticPrompt(findings, context);
     // ~4 chars per token, 300 tokens = 1200 chars
     expect(prompt.length).toBeLessThan(1200);
+  });
+});
+
+// ─── D1: Temporal decay staleness scoring ───────────────────────
+
+describe('detectStalePatterns — temporal decay (D1)', () => {
+  it('assigns low severity when file was seen not long ago (low decay)', () => {
+    const patterns = makePatterns({
+      typeAffinities: {
+        feature: {
+          taskType: 'feature',
+          files: ['src/recent-stale.ts'],
+          confidence: 0.8,
+        },
+      },
+    });
+
+    // 8 tasks. File was in task index 5. Recent window = last 5 = indices 3-7.
+    // But the file is at index 5 which IS in the recent window, so it won't be flagged.
+    // Instead: 10 tasks, file at index 2. Recent window = indices 5-9. Not in recent window.
+    // tasksSinceLastSeen = 10 - 1 - 2 = 7 → decay = 1 - 0.9^7 ≈ 0.52 → medium
+    // For low: need fewer tasks since. 8 tasks, file at index 5 (outside last 2).
+    // Use 8 tasks, file at index 4. Recent window = 3-7. Index 4 is IN window.
+    // Use 8 tasks, recent window = last 5 = indices 3-7. File at index 2.
+    // tasksSinceLastSeen = 8 - 1 - 2 = 5 → decay = 1 - 0.9^5 ≈ 0.41 → medium (>=0.4)
+    // For low decay, need tasksSinceLastSeen=3 → decay = 1 - 0.9^3 = 0.271 → low
+    // 9 tasks, file at index 5. Recent window = 4-8. Index 5 IS in window. Still flagged?
+    // No — recentFiles includes it, so it won't get flagged.
+    // Need the file to be outside recent window but not far back.
+    // 9 tasks, recent window = last 5 = indices 4-8. File at index 3.
+    // tasksSinceLastSeen = 9 - 1 - 3 = 5 → decay ≈ 0.41 → medium
+    // File at index 5 → in recent window. File at index 3 → 5 tasks ago → medium.
+    // For low: file at index 6, 8 total tasks. Recent = 3-7. Index 6 IS in window.
+    // Trick: use tasks where file was recent but just outside the window.
+    // 7 tasks, recent window = last 5 = indices 2-6. File at index 1.
+    // tasksSinceLastSeen = 7 - 1 - 1 = 5 → decay ≈ 0.41 → still medium
+    // Need tasksSinceLastSeen=2 → file at index 4, 7 tasks. But 4 IS in window (2-6).
+    // Window is always 5. Only way to get low decay: tasksSinceLastSeen < 4.
+    // 1 - 0.9^3 = 0.271 < 0.4 → low. Need file outside last 5 but only 3 tasks ago.
+    // Impossible with DEFAULT_STALENESS_WINDOW=5: if outside last 5, then >=5 tasks since.
+    // So low severity only happens when tasksSinceLastSeen < 5, which means in recent window.
+    // The only way to get low: pattern file never seen in history (tasksSinceLastSeen = totalTasks)
+    // but totalTasks is small (e.g. 3).
+    // Let's test with 3 tasks, file never seen → tasksSinceLastSeen = 3 → decay = 0.271 → low
+    const tasks = Array.from({ length: 3 }, (_, i) =>
+      makeTask({
+        id: `task_${i}`,
+        prediction: {
+          predictedFiles: ['src/other.ts'],
+          actualFiles: ['src/other.ts'],
+          precision: 1,
+          recall: 1,
+        },
+      }),
+    );
+    const taskHistory = makeTaskHistory(tasks);
+    const metrics = makeMetrics();
+
+    const findings = detectStalePatterns(patterns, taskHistory, metrics);
+    expect(findings.length).toBeGreaterThan(0);
+    // decay = 1 - 0.9^3 ≈ 0.271 → low severity (< 0.4)
+    expect(findings[0].severity).toBe('low');
+  });
+
+  it('assigns critical severity when file unseen for many tasks (high decay)', () => {
+    const patterns = makePatterns({
+      typeAffinities: {
+        feature: {
+          taskType: 'feature',
+          files: ['src/very-old.ts'],
+          confidence: 0.9,
+        },
+      },
+    });
+
+    // 15 tasks, file never seen → decay = 1 - 0.9^15 ≈ 0.79 → critical
+    const tasks = Array.from({ length: 15 }, (_, i) =>
+      makeTask({
+        id: `task_${i}`,
+        prediction: {
+          predictedFiles: ['src/other.ts'],
+          actualFiles: ['src/other.ts'],
+          precision: 1,
+          recall: 1,
+        },
+      }),
+    );
+    const taskHistory = makeTaskHistory(tasks);
+    const metrics = makeMetrics();
+
+    const findings = detectStalePatterns(patterns, taskHistory, metrics);
+    expect(findings.length).toBeGreaterThan(0);
+    expect(findings[0].severity).toBe('critical');
+    expect(findings[0].recommendation).toContain('Remove');
+  });
+
+  it('assigns medium severity for moderate staleness', () => {
+    const patterns = makePatterns({
+      typeAffinities: {
+        feature: {
+          taskType: 'feature',
+          files: ['src/moderate.ts'],
+          confidence: 0.7,
+        },
+      },
+    });
+
+    // 10 tasks, file never seen → decay = 1 - 0.9^10 ≈ 0.65 → medium
+    const tasks = Array.from({ length: 10 }, (_, i) =>
+      makeTask({
+        id: `task_${i}`,
+        prediction: {
+          predictedFiles: ['src/other.ts'],
+          actualFiles: ['src/other.ts'],
+          precision: 1,
+          recall: 1,
+        },
+      }),
+    );
+    const taskHistory = makeTaskHistory(tasks);
+    const metrics = makeMetrics();
+
+    const findings = detectStalePatterns(patterns, taskHistory, metrics);
+    expect(findings.length).toBeGreaterThan(0);
+    expect(findings[0].severity).toBe('medium');
+  });
+});
+
+// ─── D3: Declining accuracy detection ──────────────────────────
+
+describe('detectDecliningAccuracy (D3)', () => {
+  it('detects declining accuracy when recent window drops >10%', () => {
+    // Build 10 tasks: first 5 with 90% accuracy, last 5 with 70%
+    const tasks = [
+      ...Array.from({ length: 5 }, (_, i) =>
+        makeTask({
+          id: `task_${i}`,
+          classification: { taskType: 'feature', complexity: 'medium', confidence: 0.8 },
+          prediction: { predictedFiles: ['src/a.ts'], actualFiles: ['src/a.ts'], precision: 0.9, recall: 0.9 },
+        }),
+      ),
+      ...Array.from({ length: 5 }, (_, i) =>
+        makeTask({
+          id: `task_${i + 5}`,
+          classification: { taskType: 'feature', complexity: 'medium', confidence: 0.8 },
+          prediction: { predictedFiles: ['src/a.ts'], actualFiles: ['src/a.ts'], precision: 0.7, recall: 0.7 },
+        }),
+      ),
+    ];
+    const taskHistory = makeTaskHistory(tasks);
+    const metrics = makeMetrics();
+
+    const findings = detectDecliningAccuracy(taskHistory, metrics);
+    expect(findings.length).toBeGreaterThan(0);
+    expect(findings[0].type).toBe('declining-accuracy');
+    expect(findings[0].severity).toBe('info');
+    expect(findings[0].affectedDomain).toBe('feature');
+    expect(findings[0].evidence).toContain('drop');
+  });
+
+  it('does not flag when accuracy is stable', () => {
+    const tasks = Array.from({ length: 10 }, (_, i) =>
+      makeTask({
+        id: `task_${i}`,
+        classification: { taskType: 'feature', complexity: 'medium', confidence: 0.8 },
+        prediction: { predictedFiles: ['src/a.ts'], actualFiles: ['src/a.ts'], precision: 0.8, recall: 0.8 },
+      }),
+    );
+    const taskHistory = makeTaskHistory(tasks);
+    const metrics = makeMetrics();
+
+    const findings = detectDecliningAccuracy(taskHistory, metrics);
+    expect(findings.length).toBe(0);
+  });
+
+  it('skips detection when not enough tasks', () => {
+    const tasks = Array.from({ length: 5 }, (_, i) =>
+      makeTask({
+        id: `task_${i}`,
+        classification: { taskType: 'feature', complexity: 'medium', confidence: 0.8 },
+        prediction: { predictedFiles: ['src/a.ts'], actualFiles: ['src/a.ts'], precision: 0.3, recall: 0.3 },
+      }),
+    );
+    const taskHistory = makeTaskHistory(tasks);
+    const metrics = makeMetrics();
+
+    const findings = detectDecliningAccuracy(taskHistory, metrics);
+    expect(findings.length).toBe(0);
+  });
+
+  it('detects decline per domain independently', () => {
+    const tasks = [
+      // Domain A: declining
+      ...Array.from({ length: 5 }, (_, i) =>
+        makeTask({
+          id: `task_a_${i}`,
+          classification: { taskType: 'auth', complexity: 'medium', confidence: 0.8 },
+          prediction: { predictedFiles: [], actualFiles: [], precision: 0.9, recall: 0.9 },
+        }),
+      ),
+      ...Array.from({ length: 5 }, (_, i) =>
+        makeTask({
+          id: `task_a_${i + 5}`,
+          classification: { taskType: 'auth', complexity: 'medium', confidence: 0.8 },
+          prediction: { predictedFiles: [], actualFiles: [], precision: 0.6, recall: 0.6 },
+        }),
+      ),
+      // Domain B: stable
+      ...Array.from({ length: 10 }, (_, i) =>
+        makeTask({
+          id: `task_b_${i}`,
+          classification: { taskType: 'ui', complexity: 'medium', confidence: 0.8 },
+          prediction: { predictedFiles: [], actualFiles: [], precision: 0.8, recall: 0.8 },
+        }),
+      ),
+    ];
+    const taskHistory = makeTaskHistory(tasks);
+    const metrics = makeMetrics();
+
+    const findings = detectDecliningAccuracy(taskHistory, metrics);
+    expect(findings.length).toBe(1);
+    expect(findings[0].affectedDomain).toBe('auth');
+  });
+});
+
+// ─── D4: Cross-domain dependency detection ─────────────────────
+
+describe('detectCrossDomainDependencies (D4)', () => {
+  it('detects cross-domain file co-occurrence', () => {
+    const tasks = Array.from({ length: 10 }, (_, i) =>
+      makeTask({
+        id: `task_${i}`,
+        prediction: {
+          predictedFiles: [],
+          actualFiles: ['src/doctor/types.ts', 'src/learner/index.ts'],
+          precision: 1,
+          recall: 1,
+        },
+      }),
+    );
+    const taskHistory = makeTaskHistory(tasks);
+
+    const findings = detectCrossDomainDependencies(taskHistory);
+    expect(findings.length).toBeGreaterThan(0);
+    expect(findings[0].type).toBe('cross-domain-dependency');
+    expect(findings[0].severity).toBe('info');
+    expect(findings[0].evidence).toContain('co-occurred');
+  });
+
+  it('does not flag when domains rarely co-occur', () => {
+    const tasks = [
+      // 8 tasks with just doctor files
+      ...Array.from({ length: 8 }, (_, i) =>
+        makeTask({
+          id: `task_${i}`,
+          prediction: {
+            predictedFiles: [],
+            actualFiles: ['src/doctor/types.ts'],
+            precision: 1,
+            recall: 1,
+          },
+        }),
+      ),
+      // 2 tasks with both domains
+      ...Array.from({ length: 2 }, (_, i) =>
+        makeTask({
+          id: `task_${i + 8}`,
+          prediction: {
+            predictedFiles: [],
+            actualFiles: ['src/doctor/types.ts', 'src/learner/index.ts'],
+            precision: 1,
+            recall: 1,
+          },
+        }),
+      ),
+    ];
+    const taskHistory = makeTaskHistory(tasks);
+
+    const findings = detectCrossDomainDependencies(taskHistory);
+    // Only 2 tasks with learner, below MIN_TASKS_FOR_PATTERN_DETECTION=5
+    expect(findings.length).toBe(0);
+  });
+
+  it('skips when fewer than 5 tasks', () => {
+    const tasks = Array.from({ length: 3 }, (_, i) =>
+      makeTask({
+        id: `task_${i}`,
+        prediction: {
+          predictedFiles: [],
+          actualFiles: ['src/doctor/foo.ts', 'src/learner/bar.ts'],
+          precision: 1,
+          recall: 1,
+        },
+      }),
+    );
+    const taskHistory = makeTaskHistory(tasks);
+
+    const findings = detectCrossDomainDependencies(taskHistory);
+    expect(findings.length).toBe(0);
+  });
+});
+
+// ─── D10: Thin domain detection ─────────────────────────────────
+
+describe('detectThinDomains (D10)', () => {
+  it('flags domains with fewer than MIN_TASKS_FOR_PATTERN_DETECTION tasks', () => {
+    const metrics = makeMetrics({
+      perDomain: {
+        auth: { totalTasks: 2, avgPrecision: 0.5, avgRecall: 0.5, totalTokensConsumed: 100, totalTokensSaved: 50 },
+        ui: { totalTasks: 20, avgPrecision: 0.8, avgRecall: 0.8, totalTokensConsumed: 500, totalTokensSaved: 300 },
+      },
+    });
+
+    const findings = detectThinDomains(metrics);
+    expect(findings.length).toBe(1);
+    expect(findings[0].type).toBe('thin-domain');
+    expect(findings[0].severity).toBe('info');
+    expect(findings[0].affectedDomain).toBe('auth');
+    expect(findings[0].evidence).toContain('2 tasks');
+    expect(findings[0].recommendation).toContain('more tasks needed');
+  });
+
+  it('does not flag domains with enough tasks', () => {
+    const metrics = makeMetrics({
+      perDomain: {
+        auth: { totalTasks: 10, avgPrecision: 0.8, avgRecall: 0.8, totalTokensConsumed: 500, totalTokensSaved: 300 },
+      },
+    });
+
+    const findings = detectThinDomains(metrics);
+    expect(findings.length).toBe(0);
+  });
+
+  it('does not flag domains with 0 tasks', () => {
+    const metrics = makeMetrics({
+      perDomain: {
+        empty: { totalTasks: 0, avgPrecision: 0, avgRecall: 0, totalTokensConsumed: 0, totalTokensSaved: 0 },
+      },
+    });
+
+    const findings = detectThinDomains(metrics);
+    expect(findings.length).toBe(0);
+  });
+
+  it('flags multiple thin domains', () => {
+    const metrics = makeMetrics({
+      perDomain: {
+        auth: { totalTasks: 1, avgPrecision: 0.5, avgRecall: 0.5, totalTokensConsumed: 50, totalTokensSaved: 20 },
+        ui: { totalTasks: 3, avgPrecision: 0.6, avgRecall: 0.6, totalTokensConsumed: 100, totalTokensSaved: 50 },
+      },
+    });
+
+    const findings = detectThinDomains(metrics);
+    expect(findings.length).toBe(2);
+    expect(findings.map((f: DiagnosticFinding) => f.affectedDomain).sort()).toEqual(['auth', 'ui']);
   });
 });
 

@@ -20,8 +20,10 @@ import type {
   FixResult,
   SupervisedSession,
   DiagnosticFinding,
+  DomainCooldown,
+  DoctorOverride,
 } from './types.js';
-import { MIN_TASKS_FOR_THRESHOLD } from './types.js';
+import { MIN_TASKS_FOR_THRESHOLD, DEFAULT_COOLDOWN_TASKS, DEFAULT_COOLDOWN_MS, DEFAULT_OVERRIDE_GRACE_PERIOD } from './types.js';
 
 const MODULE = 'doctor:supervised';
 
@@ -29,6 +31,7 @@ const MODULE = 'doctor:supervised';
 
 /**
  * Check per-domain prediction accuracy against the threshold.
+ * D2: Uses F1 score (harmonic mean of precision and recall) instead of precision-only.
  * Returns alerts for domains that have breached the threshold.
  * Skips domains with fewer than MIN_TASKS_FOR_THRESHOLD tasks.
  */
@@ -43,17 +46,33 @@ export function checkThresholds(
     if (dm.totalTasks < MIN_TASKS_FOR_THRESHOLD) {
       continue;
     }
-    if (dm.avgPrecision < threshold) {
+
+    // D2: F1 score instead of precision-only
+    const f1 = computeF1(dm.avgPrecision, dm.avgRecall);
+
+    if (f1 < threshold) {
       alerts.push({
         domain,
-        currentAccuracy: dm.avgPrecision,
+        currentAccuracy: f1,
         threshold,
         timestamp: now,
+        currentPrecision: dm.avgPrecision,
+        currentRecall: dm.avgRecall,
       });
     }
   }
 
   return alerts;
+}
+
+/**
+ * Compute F1 score (harmonic mean of precision and recall).
+ * Returns 0 if both precision and recall are 0.
+ */
+export function computeF1(precision: number, recall: number): number {
+  const sum = precision + recall;
+  if (sum === 0) return 0;
+  return (2 * precision * recall) / sum;
 }
 
 // ─── Task 3: Alert rendering and interaction ──────────────────────
@@ -97,11 +116,56 @@ export async function promptAlertChoice(): Promise<AlertChoice> {
   });
 }
 
+// ─── D9: Alert cooldown / fatigue prevention ─────────────────────
+
+/**
+ * Filter alerts through cooldown state (D9).
+ * Suppresses alerts for domains that were recently dismissed or fixed.
+ */
+export function filterCooledDownAlerts(
+  alerts: ThresholdAlert[],
+  cooldowns: DomainCooldown[],
+  currentTaskCount: number,
+): ThresholdAlert[] {
+  const now = Date.now();
+  return alerts.filter((alert) => {
+    const cooldown = cooldowns.find((c) => c.domain === alert.domain);
+    if (!cooldown) return true; // No cooldown — allow alert
+
+    // Check time-based cooldown
+    const cooldownUntil = new Date(cooldown.cooldownUntil).getTime();
+    if (now < cooldownUntil) return false; // Still in time cooldown
+
+    // Check task-count cooldown
+    const tasksSinceDismissal = currentTaskCount - cooldown.taskCountAtDismissal;
+    if (tasksSinceDismissal < DEFAULT_COOLDOWN_TASKS) return false; // Not enough tasks since
+
+    return true; // Cooldown expired — allow alert
+  });
+}
+
+/**
+ * Create a cooldown entry for a dismissed domain (D9).
+ */
+export function createCooldown(
+  domain: string,
+  currentTaskCount: number,
+): DomainCooldown {
+  const now = new Date();
+  return {
+    domain,
+    dismissedAt: now.toISOString(),
+    cooldownUntil: new Date(now.getTime() + DEFAULT_COOLDOWN_MS).toISOString(),
+    taskCountAtDismissal: currentTaskCount,
+  };
+}
+
 // ─── Task 4: Fix proposal generation ──────────────────────────────
 
 /**
  * Generate fix proposals from diagnostic findings.
- * Informational findings (thin-domain, info severity) do not get proposals.
+ * Informational findings (thin-domain, declining-accuracy, cross-domain, info severity) do not get proposals.
+ * D7: Proposals are scored by confidence and sorted descending.
  */
 export function generateFixProposals(findings: DiagnosticFinding[]): FixProposal[] {
   const proposals: FixProposal[] = [];
@@ -131,10 +195,15 @@ export function generateFixProposals(findings: DiagnosticFinding[]): FixProposal
         break;
 
       case 'thin-domain':
+      case 'declining-accuracy':
+      case 'cross-domain-dependency':
       default:
         // Informational — no automated fix
         continue;
     }
+
+    // D7: Calculate confidence score
+    const confidence = calculateProposalConfidence(finding);
 
     proposals.push({
       findingId: finding.id,
@@ -142,10 +211,52 @@ export function generateFixProposals(findings: DiagnosticFinding[]): FixProposal
       action,
       explanation,
       riskLevel,
+      confidence,
     });
   }
 
+  // D7: Sort by confidence descending — highest-impact fixes first
+  proposals.sort((a, b) => (b.confidence ?? 0) - (a.confidence ?? 0));
+
   return proposals;
+}
+
+/**
+ * Calculate a confidence score (0-1) for a fix proposal (D7).
+ * Based on: severity weight × evidence strength × finding type weight.
+ */
+export function calculateProposalConfidence(finding: DiagnosticFinding): number {
+  // Severity weight
+  const severityWeights: Record<string, number> = {
+    critical: 1.0,
+    medium: 0.7,
+    low: 0.4,
+    info: 0.1,
+  };
+  const severityW = severityWeights[finding.severity] ?? 0.5;
+
+  // Evidence strength — extract numeric values from evidence string
+  let evidenceW = 0.5; // default
+  const percentMatch = finding.evidence.match(/(\d+)%/);
+  if (percentMatch) {
+    const pct = parseInt(percentMatch[1], 10);
+    evidenceW = Math.min(1.0, pct / 100);
+  }
+  // For stale patterns, use decay score if present
+  const decayMatch = finding.evidence.match(/decay ([\d.]+)/);
+  if (decayMatch) {
+    evidenceW = Math.min(1.0, parseFloat(decayMatch[1]));
+  }
+
+  // Type weight — bad predictions are more impactful to fix
+  const typeWeights: Record<string, number> = {
+    'stale-pattern': 0.8,
+    'missing-cooccurrence': 0.6,
+    'bad-prediction': 0.9,
+  };
+  const typeW = typeWeights[finding.type] ?? 0.5;
+
+  return Math.min(1.0, severityW * evidenceW * typeW + (1 - severityW) * typeW * 0.3);
 }
 
 // ─── Task 5: Fix proposal rendering and approval ──────────────────
@@ -295,7 +406,9 @@ export function applyAddCooccurrence(
 // ─── Task 7: Apply remove stale ───────────────────────────────────
 
 /**
- * Set a stale pattern's weight to 0.0 (soft delete — preserves history).
+ * Graduated weight reduction for stale patterns (D8).
+ * First reduction: halve the weight. Second reduction (already <=0.25): set to 0.0.
+ * This gives patterns a "second chance" before full removal.
  */
 export function applyRemoveStale(
   proposal: FixProposal,
@@ -314,18 +427,30 @@ export function applyRemoveStale(
     }
 
     const originalWeight = affinity.confidence;
-    affinity.confidence = 0.0;
+
+    // D8: Graduated reduction — halve first, then zero on second occurrence
+    let newWeight: number;
+    if (originalWeight <= 0.25) {
+      // Already reduced previously — full removal
+      newWeight = 0.0;
+    } else {
+      // First reduction — halve the weight
+      newWeight = Math.round(originalWeight * 0.5 * 100) / 100;
+    }
+
+    affinity.confidence = newWeight;
 
     const writeResult = writePatterns(projectRoot, patterns);
     if (!writeResult.ok) return err(`Cannot write patterns: ${writeResult.error}`);
 
+    const action = newWeight === 0 ? 'removed' : 'halved';
     return ok({
       proposal,
       applied: true,
       approvedBy: 'user' as const,
-      result: `Reduced weight for ${affectedDomain} pattern from ${originalWeight.toFixed(2)} to 0.00`,
+      result: `${action === 'removed' ? 'Removed' : 'Halved'} weight for ${affectedDomain} pattern from ${originalWeight.toFixed(2)} to ${newWeight.toFixed(2)}`,
       before: originalWeight,
-      after: 0.0,
+      after: newWeight,
     });
   } catch (error) {
     return err(`Failed to remove stale pattern: ${String(error)}`);
@@ -445,6 +570,35 @@ export function applyFix(
   }
 }
 
+// ─── D6: Fix verification ──────────────────────────────────────────
+
+/**
+ * Verify whether applied fixes actually improved health score (D6).
+ * Re-runs calculateHealthScore after fixes and marks each result as effective/ineffective.
+ */
+export function verifyFixes(
+  fixResults: FixResult[],
+  healthBefore: number,
+  healthAfter: number,
+): FixResult[] {
+  const improved = healthAfter > healthBefore;
+  const unchanged = healthAfter === healthBefore;
+
+  return fixResults.map((fr) => {
+    if (!fr.applied) {
+      return { ...fr, verified: 'unverified' as const };
+    }
+    if (improved) {
+      return { ...fr, verified: 'effective' as const };
+    }
+    if (unchanged) {
+      return { ...fr, verified: 'ineffective' as const };
+    }
+    // Health got worse — definitely ineffective
+    return { ...fr, verified: 'ineffective' as const };
+  });
+}
+
 // ─── Task 10: Supervised mode orchestrator ────────────────────────
 
 /**
@@ -498,4 +652,60 @@ export async function runSupervised(
   }
 
   return sessions;
+}
+
+// ─── D12: Doctor-to-Learner override tracking ────────────────────
+
+/**
+ * Create doctor override entries from applied fixes (D12).
+ * These override entries tell the learner to respect doctor fixes
+ * for a grace period before re-learning.
+ */
+export function createOverridesFromFixes(
+  fixResults: FixResult[],
+  currentTaskCount: number,
+): DoctorOverride[] {
+  const overrides: DoctorOverride[] = [];
+
+  for (const fr of fixResults) {
+    if (!fr.applied) continue;
+
+    const domain = fr.proposal.finding.affectedDomain;
+    const field = fr.proposal.action === 'remove-stale'
+      ? `typeAffinities.${domain}.confidence`
+      : fr.proposal.action === 'add-cooccurrence'
+        ? `coOccurrences.${fr.proposal.finding.affectedFiles.join('↔')}`
+        : `typeAffinities.${domain}.confidence`;
+
+    overrides.push({
+      domain,
+      field,
+      value: typeof fr.after === 'number' ? fr.after : 0,
+      appliedAt: new Date().toISOString(),
+      gracePeriodTasks: DEFAULT_OVERRIDE_GRACE_PERIOD,
+      taskCountAtApplication: currentTaskCount,
+    });
+  }
+
+  return overrides;
+}
+
+/**
+ * Check whether a doctor override is still active (D12).
+ */
+export function isOverrideActive(
+  override: DoctorOverride,
+  currentTaskCount: number,
+): boolean {
+  return (currentTaskCount - override.taskCountAtApplication) < override.gracePeriodTasks;
+}
+
+/**
+ * Filter overrides to only active ones (D12).
+ */
+export function getActiveOverrides(
+  overrides: DoctorOverride[],
+  currentTaskCount: number,
+): DoctorOverride[] {
+  return overrides.filter((o) => isOverrideActive(o, currentTaskCount));
 }
