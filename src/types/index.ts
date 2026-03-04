@@ -36,6 +36,8 @@ export type {
   OverallMetrics,
   SignalAccuracy,
   ModelPerformance,
+  ModelTokenStats,
+  UsageHistoryEntry,
   Metrics,
   KeywordIndex,
   Finding,

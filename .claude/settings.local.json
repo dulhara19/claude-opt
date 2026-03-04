@@ -12,7 +12,10 @@
       "Bash(npm test:*)",
       "Bash(node:*)",
       "Bash(GIT_AUTHOR_DATE=\"2026-03-10T09:00:00+0530\" GIT_COMMITTER_DATE=\"2026-03-10T09:00:00+0530\" git:*)",
-      "Bash(GIT_AUTHOR_DATE=\"2026-03-10T12:30:00+0530\" GIT_COMMITTER_DATE=\"2026-03-10T12:30:00+0530\" git:*)"
+      "Bash(GIT_AUTHOR_DATE=\"2026-03-10T12:30:00+0530\" GIT_COMMITTER_DATE=\"2026-03-10T12:30:00+0530\" git:*)",
+      "Bash(find /c/Users/Dulhara/Desktop/claude_optimizer/src -name \"*.ts\" -type f | xargs grep -l \"captureOutcome\\\\|OutcomeCapture\" | head -5)",
+      "Bash(grep -n \"MAX_HISTORY\\\\|taskHistoryCap\" src/store/*.ts src/types/*.ts)",
+      "Bash(git add:*)"
     ]
   }
 }

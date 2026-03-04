@@ -8,6 +8,8 @@
 export interface BudgetWarnings {
   inline: number;
   blocking: number;
+  /** Awareness threshold for early budget notification (BC3). Default 0.50. */
+  awareness?: number;
 }
 
 export interface Config {
@@ -77,6 +79,8 @@ export interface TaskClassification {
   taskType: string;
   complexity: string;
   confidence: number;
+  /** Domain classification (L2). */
+  domain?: string;
 }
 
 export interface TaskPrediction {
@@ -84,6 +88,8 @@ export interface TaskPrediction {
   actualFiles: string[];
   precision: number;
   recall: number;
+  /** Per-file confidence scores, parallel to predictedFiles (L3). */
+  predictedScores?: number[];
 }
 
 export interface TaskRouting {
@@ -116,6 +122,8 @@ export interface TaskEntry {
   routing: TaskRouting;
   tokens: TaskTokens;
   feedback: TaskFeedback | null;
+  /** Session number when this task was captured (L22). */
+  sessionId?: number;
 }
 
 export interface TaskHistory {
@@ -207,14 +215,36 @@ export interface SignalAccuracy {
   truePositives: number;
   falsePositives: number;
   totalPredictions: number;
+  /** Missed opportunities — false negatives where this signal had data (L7). */
+  missedOpportunities?: number;
 }
 
 /** Per-model performance tracking for router learning (#7). */
 export interface ModelPerformance {
+  /** Weighted successes — continuous score sum (L13). */
   successes: number;
   failures: number;
   totalTasks: number;
   avgTokenCost: number;
+  /** Average execution duration in milliseconds (L14). */
+  avgDurationMs?: number;
+}
+
+/** Per-model token tracking (TK6). */
+export interface ModelTokenStats {
+  totalTasks: number;
+  totalTokensConsumed: number;
+  totalTokensSaved: number;
+}
+
+/** Lightweight per-task usage record for history (TK2). */
+export interface UsageHistoryEntry {
+  taskId: string;
+  tokensUsed: number;
+  savings: number;
+  domain: string;
+  modelTier?: string;
+  timestamp: string;
 }
 
 export interface Metrics {
@@ -235,6 +265,12 @@ export interface Metrics {
   learnedThresholds?: Record<string, number>;
   /** Model performance per model×taskType×complexity key (#7). */
   modelPerformance?: Record<string, ModelPerformance>;
+  /** Recent per-task usage history, FIFO capped at MAX_USAGE_HISTORY (TK2). */
+  recentUsage?: UsageHistoryEntry[];
+  /** Per-model token tracking (TK6). */
+  perModel?: Record<string, ModelTokenStats>;
+  /** Learned unoptimized multiplier from empirical data (L4). */
+  empiricalMultiplier?: number;
 }
 
 // ─── keyword-index.json ────────────────────────────────────────

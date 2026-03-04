@@ -195,7 +195,47 @@ export async function runPipeline(
         activeWindow = createWindow(windows, cfg.windowDurationMs, cfg.tokenBudget);
       }
       const ws = getWindowStatus(activeWindow);
-      return checkBudget(ws, cfg.budgetWarnings);
+
+      // BC1: Build per-type averages from recent usage for smarter task estimation
+      const perTypeAvg: Record<string, { avg: number; count: number }> = {};
+      if (metrics.recentUsage) {
+        for (const entry of metrics.recentUsage) {
+          const type = (entry as Record<string, unknown>).taskType as string | undefined;
+          if (!type) continue;
+          const existing = perTypeAvg[type] ?? { avg: 0, count: 0 };
+          existing.avg = (existing.avg * existing.count + entry.tokensUsed) / (existing.count + 1);
+          existing.count += 1;
+          perTypeAvg[type] = existing;
+        }
+      }
+
+      // BC5: Calculate total savings for this window
+      const windowStart = Date.parse(activeWindow.startedAt);
+      let tokensSavedThisWindow = 0;
+      if (metrics.recentUsage) {
+        for (const entry of metrics.recentUsage) {
+          if (Date.parse(entry.timestamp) >= windowStart && entry.savings > 0) {
+            tokensSavedThisWindow += entry.savings;
+          }
+        }
+      }
+
+      // BC10: Per-domain consumption within this window
+      const domainConsumption: Record<string, number> = {};
+      if (metrics.recentUsage) {
+        for (const entry of metrics.recentUsage) {
+          if (Date.parse(entry.timestamp) >= windowStart) {
+            domainConsumption[entry.domain] = (domainConsumption[entry.domain] ?? 0) + entry.tokensUsed;
+          }
+        }
+      }
+
+      return checkBudget(ws, cfg.budgetWarnings, {
+        perTypeAvg: Object.keys(perTypeAvg).length > 0 ? perTypeAvg : undefined,
+        taskType: ctx.classification?.type,
+        tokensSavedThisWindow: tokensSavedThisWindow > 0 ? tokensSavedThisWindow : undefined,
+        domainConsumption: Object.keys(domainConsumption).length > 0 ? domainConsumption : undefined,
+      });
     },
     null,
     MODULE,
@@ -212,11 +252,11 @@ export async function runPipeline(
       } catch (error) {
         logger.error(MODULE, 'Budget prompt failed, proceeding (fail-open)', error);
       }
-    } else if (budgetCheckResult.level === 'inline') {
+    } else if (budgetCheckResult.level === 'inline' || budgetCheckResult.level === 'awareness') {
       try {
         await promptBudgetWarning(budgetCheckResult);
       } catch {
-        // Inline display failure is non-fatal
+        // Inline/awareness display failure is non-fatal
       }
     }
   }
@@ -272,6 +312,9 @@ export async function runPipeline(
           predictionConfidence,
           compressionRatio,
           projectRoot: ctx.workingDir,
+          modelTier: ctx.routing?.model,
+          taskType: ctx.classification?.type,
+          storeCache: ctx.storeCache,
         });
 
         if (result.ok) return result.value;

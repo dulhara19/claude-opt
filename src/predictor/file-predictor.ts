@@ -378,9 +378,13 @@ export function predictFiles(ctx: PipelineContext): PredictionResult {
 
   const totalCandidates = existingPredictions.length;
 
-  // Use learned threshold for this task type, or fall back to static default
+  // L12: Use learned threshold with domain:type → type → static fallback chain
   const taskType = ctx.classification?.type;
-  const learnedThreshold = taskType && cache?.metrics?.learnedThresholds?.[taskType];
+  const domain = ctx.classification?.domain;
+  const domainTypeKey = domain && taskType ? `${domain}:${taskType}` : undefined;
+  const learnedThreshold =
+    (domainTypeKey && cache?.metrics?.learnedThresholds?.[domainTypeKey])
+    ?? (taskType && cache?.metrics?.learnedThresholds?.[taskType]);
   const threshold = learnedThreshold ?? CONFIDENCE_THRESHOLD;
 
   // Filter by confidence threshold
