@@ -15,6 +15,44 @@ import { registerVisibilityCommands, runDryRunCommand, forgetFile, runCorrectCom
 const require = createRequire(import.meta.url);
 const pkg = require('../package.json') as { version: string };
 
+// ─── Banner ──────────────────────────────────────────────────
+
+function padEnd(n: number): string {
+  return ' '.repeat(Math.max(0, n));
+}
+
+function printBanner(): void {
+  const g = chalk.hex('#4AE3B5');    // green-cyan gradient
+  const b = chalk.hex('#6B8AFF');    // blue accent
+  const p = chalk.hex('#C084FC');    // purple accent
+  const w = chalk.bold.white;
+  const dim = chalk.dim;
+
+  const lines = [
+    '',
+    g('     ╔═══════════════════════════════════════════════════╗'),
+    g('     ║') + '                                                   ' + g('║'),
+    g('     ║') + w('        ___  _                 _                  ') + g('║'),
+    g('     ║') + b('       / __|| | __ _  _  _  __| | ___             ') + g('║'),
+    g('     ║') + b('      | (__ | |/ _` || || |/ _` |/ -_)            ') + g('║'),
+    g('     ║') + b('       \\___||_|\\__,_| \\_,_|\\__,_|\\___|            ') + g('║'),
+    g('     ║') + '            ' + p.bold('───── ') + w('opt') + p.bold(' ─────') + '                       ' + g('║'),
+    g('     ║') + '                                                   ' + g('║'),
+    g('     ║') + '  ' + p('Intelligent Token Optimizer for Claude Code') + '      ' + g('║'),
+    g('     ║') + '                                                   ' + g('║'),
+    g('     ║') + '  ' + dim('Version') + '  ' + chalk.green('v' + pkg.version) + padEnd(38 - pkg.version.length) + g('║'),
+    g('     ║') + '  ' + dim('Author') + '   ' + w('Dulhara') + '                                ' + g('║'),
+    g('     ║') + '  ' + dim('GitHub') + '   ' + b('https://github.com/dulhara19') + '           ' + g('║'),
+    g('     ║') + '                                                   ' + g('║'),
+    g('     ╚═══════════════════════════════════════════════════╝'),
+    '',
+  ];
+
+  for (const line of lines) {
+    console.log(line);
+  }
+}
+
 // ─── Helpers ──────────────────────────────────────────────────
 
 function logStep(step: number, total: number, message: string): void {
@@ -50,6 +88,7 @@ async function runInit(projectRoot: string, options: { force?: boolean }): Promi
     return runScan(projectRoot, { full: false });
   }
 
+  printBanner();
   console.log(chalk.bold('Initializing claude-opt...\n'));
 
   // Step 1: Create store
@@ -173,6 +212,7 @@ program
   .argument('[task...]', 'Task description to optimize')
   .action(async (taskWords: string[], options: { verbose?: boolean; quiet?: boolean; dryRun?: boolean }) => {
     if (taskWords.length === 0) {
+      printBanner();
       program.help();
       return;
     }
@@ -454,6 +494,7 @@ program
     const storePath = resolveStorePath(projectRoot);
     const steps: string[] = [];
 
+    printBanner();
     console.log(chalk.bold('Setting up Claude Code integration...\n'));
 
     // Step 1: Initialize if needed

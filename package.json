@@ -1,6 +1,6 @@
 {
   "name": "claude-opt",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Claude Code Token Optimizer — intelligent context management for Claude Code CLI",
   "type": "module",
   "main": "dist/index.js",
