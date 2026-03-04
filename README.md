@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="claude-opt-banner.PNG" alt="claude-opt banner" width="100%" />
+</p>
+
 # claude-opt
 
 **Intelligent token optimizer for [Claude Code](https://docs.anthropic.com/en/docs/claude-code).** Reduces context window usage through smart file prediction, prompt compression, and adaptive learning — so you get better results while spending fewer tokens.
