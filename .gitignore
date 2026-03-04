@@ -26,3 +26,7 @@ coverage/
 # OS files
 .DS_Store
 Thumbs.db
+
+# BMAD framework
+_bmad/
+_bmad-output/
