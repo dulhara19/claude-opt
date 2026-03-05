@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Claude Optimizer data
+.claude-opt/
+
+# Test coverage
+coverage/
+
+# Temp files
+*.tmp
+
+# Cache
+.eslintcache
+
+# Environment
+.env
+.env.*
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
