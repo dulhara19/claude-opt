@@ -1,0 +1,15 @@
+{
+  "schemaVersion": "1.0.0",
+  "overall": {
+    "totalTasks": 10,
+    "totalSessions": 3,
+    "avgPrecision": 0.85,
+    "avgRecall": 0.78,
+    "totalTokensConsumed": 50000,
+    "totalTokensSaved": 15000,
+    "savingsRate": 0.23
+  },
+  "perDomain": {},
+  "windows": [],
+  "predictionTrend": []
+}

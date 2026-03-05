@@ -1,0 +1,22 @@
+{
+  "schemaVersion": "1.0.0",
+  "scannedAt": "2026-03-04T09:00:05Z",
+  "scanType": "full",
+  "projectType": "code",
+  "totalFiles": 1,
+  "files": {
+    "src/index.ts": {
+      "path": "src/index.ts",
+      "size": 512,
+      "contentHash": "abc123",
+      "lastModified": "2026-03-04T09:00:00Z",
+      "language": "typescript",
+      "domain": "core",
+      "imports": [],
+      "exports": ["main"],
+      "keywords": ["entry", "cli"]
+    }
+  },
+  "domains": { "core": ["src/index.ts"] },
+  "ignoredPatterns": ["node_modules/**"]
+}

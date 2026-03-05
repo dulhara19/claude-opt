@@ -1,0 +1,12 @@
+{
+  "schemaVersion": "1.0.0",
+  "coOccurrences": [
+    { "files": ["src/a.ts", "src/b.ts"], "count": 5, "confidence": 0.8 }
+  ],
+  "typeAffinities": {
+    "Feature": { "taskType": "Feature", "files": ["src/feature.ts"], "confidence": 0.9 }
+  },
+  "conventions": [
+    { "pattern": "*.test.ts", "description": "Test files", "examples": ["src/a.test.ts"] }
+  ]
+}
