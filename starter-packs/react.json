@@ -1,0 +1,41 @@
+{
+  "name": "react",
+  "version": "1.0.0",
+  "description": "Starter patterns for React projects (extends typescript-node)",
+  "extends": "typescript-node",
+  "patterns": {
+    "coOccurrences": [
+      {
+        "id": "sp_react_001",
+        "files": ["*.tsx", "*.test.tsx", "*.css"],
+        "description": "React components, tests, and styles co-occur",
+        "frequency": 12,
+        "confidence": 0.85,
+        "decayFactor": 1.0
+      },
+      {
+        "id": "sp_react_002",
+        "files": ["*.tsx", "*.module.css"],
+        "description": "Components and CSS modules co-occur",
+        "frequency": 8,
+        "confidence": 0.78,
+        "decayFactor": 1.0
+      }
+    ],
+    "conventions": [
+      {
+        "id": "sp_react_conv_001",
+        "pattern": "React components use PascalCase file names",
+        "confidence": 0.82,
+        "evidenceCount": 0
+      },
+      {
+        "id": "sp_react_conv_002",
+        "pattern": "Hooks files prefixed with use (useAuth.ts, useForm.ts)",
+        "confidence": 0.80,
+        "evidenceCount": 0
+      }
+    ]
+  },
+  "keyFiles": ["package.json", "tsconfig.json", "src/App.tsx", "src/index.tsx"]
+}

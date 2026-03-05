@@ -1,0 +1,46 @@
+{
+  "name": "python",
+  "version": "1.0.0",
+  "description": "Starter patterns for Python projects",
+  "patterns": {
+    "coOccurrences": [
+      {
+        "id": "sp_py_001",
+        "files": ["*.py", "test_*.py"],
+        "description": "Python source and test files co-occur",
+        "frequency": 10,
+        "confidence": 0.80,
+        "decayFactor": 1.0
+      },
+      {
+        "id": "sp_py_002",
+        "files": ["requirements.txt", "setup.py"],
+        "description": "Dependency files relevant to package changes",
+        "frequency": 8,
+        "confidence": 0.72,
+        "decayFactor": 1.0
+      }
+    ],
+    "conventions": [
+      {
+        "id": "sp_py_conv_001",
+        "pattern": "Python files use snake_case naming",
+        "confidence": 0.90,
+        "evidenceCount": 0
+      },
+      {
+        "id": "sp_py_conv_002",
+        "pattern": "Test files prefixed with test_ or in tests/ directory",
+        "confidence": 0.85,
+        "evidenceCount": 0
+      },
+      {
+        "id": "sp_py_conv_003",
+        "pattern": "__init__.py marks Python packages",
+        "confidence": 0.88,
+        "evidenceCount": 0
+      }
+    ]
+  },
+  "keyFiles": ["setup.py", "requirements.txt", "pyproject.toml"]
+}

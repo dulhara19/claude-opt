@@ -1,0 +1,54 @@
+{
+  "name": "typescript-node",
+  "version": "1.0.0",
+  "description": "Starter patterns for TypeScript/Node.js projects",
+  "patterns": {
+    "coOccurrences": [
+      {
+        "id": "sp_ts_001",
+        "files": ["*.ts", "*.test.ts"],
+        "description": "Source files and their test files are co-located",
+        "frequency": 10,
+        "confidence": 0.80,
+        "decayFactor": 1.0
+      },
+      {
+        "id": "sp_ts_002",
+        "files": ["package.json"],
+        "description": "package.json is relevant to most dependency changes",
+        "frequency": 15,
+        "confidence": 0.75,
+        "decayFactor": 1.0
+      }
+    ],
+    "conventions": [
+      {
+        "id": "sp_ts_conv_001",
+        "pattern": "Source files in src/ directory",
+        "confidence": 0.85,
+        "evidenceCount": 0
+      },
+      {
+        "id": "sp_ts_conv_002",
+        "pattern": "Test files use .test.ts extension",
+        "confidence": 0.80,
+        "evidenceCount": 0
+      },
+      {
+        "id": "sp_ts_conv_003",
+        "pattern": "Barrel exports via index.ts in each module directory",
+        "confidence": 0.75,
+        "evidenceCount": 0
+      }
+    ],
+    "typeAffinities": {
+      "bugfix": {
+        "description": "Bug fixes often touch utility and test files"
+      },
+      "feature": {
+        "description": "New features typically involve src/ files and their tests"
+      }
+    }
+  },
+  "keyFiles": ["package.json", "tsconfig.json", "src/index.ts"]
+}

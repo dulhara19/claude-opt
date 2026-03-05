@@ -1,0 +1,38 @@
+{
+  "name": "research-markdown",
+  "version": "1.0.0",
+  "description": "Starter patterns for research and documentation projects",
+  "patterns": {
+    "coOccurrences": [
+      {
+        "id": "sp_md_001",
+        "files": ["*.md"],
+        "description": "Markdown chapters/sections reference each other",
+        "frequency": 8,
+        "confidence": 0.75,
+        "decayFactor": 1.0
+      }
+    ],
+    "conventions": [
+      {
+        "id": "sp_md_conv_001",
+        "pattern": "Documents organized by chapter/section directories",
+        "confidence": 0.78,
+        "evidenceCount": 0
+      },
+      {
+        "id": "sp_md_conv_002",
+        "pattern": "Reference materials in references/ or refs/ directory",
+        "confidence": 0.72,
+        "evidenceCount": 0
+      },
+      {
+        "id": "sp_md_conv_003",
+        "pattern": "Images/figures in images/ or figures/ directory",
+        "confidence": 0.80,
+        "evidenceCount": 0
+      }
+    ]
+  },
+  "keyFiles": ["README.md"]
+}
