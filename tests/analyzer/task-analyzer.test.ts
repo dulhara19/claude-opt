@@ -175,8 +175,13 @@ describe('classifyTask', () => {
       expect(result.complexity).toBe(Complexity.Complex);
     });
 
-    it('defaults to Medium when no clear signal', () => {
+    it('classifies short prompts without complexity keywords as Low', () => {
       const result = classifyTask('add a button to the page');
+      expect(result.complexity).toBe(Complexity.Low);
+    });
+
+    it('defaults to Medium for moderate-length prompts without complexity keywords', () => {
+      const result = classifyTask('add a button to the page that opens a modal dialog with user profile information and settings');
       expect(result.complexity).toBe(Complexity.Medium);
     });
 
