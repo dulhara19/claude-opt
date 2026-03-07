@@ -5,27 +5,22 @@
 import type { Patterns } from '../../types/index.js';
 import type { SignalScore } from '../types.js';
 import { SignalSource } from '../types.js';
-import { readPatterns } from '../../store/index.js';
 
 /**
  * Boost scores for files that co-occur with files already predicted by other signals.
  * This signal runs after the other 3 signals to apply boosting.
  *
  * @param predictedFiles - Set of file paths already predicted by other signals
- * @param projectRoot - Project root for store access
+ * @param patterns - Patterns data from store cache
  * @returns Map of filePath → SignalScore for co-occurring files
  */
 export function scoreCooccurrenceBoost(
   predictedFiles: Set<string>,
-  projectRoot: string,
+  patterns: Patterns | undefined,
 ): Map<string, SignalScore> {
   const scores = new Map<string, SignalScore>();
 
-  const patternsResult = readPatterns(projectRoot);
-  if (!patternsResult.ok) return scores;
-
-  const patterns: Patterns = patternsResult.value;
-  if (patterns.coOccurrences.length === 0) return scores;
+  if (!patterns || patterns.coOccurrences.length === 0) return scores;
 
   // For each co-occurrence pair, if one file is predicted, boost the other
   const boostCounts = new Map<string, { totalConfidence: number; sources: string[] }>();
