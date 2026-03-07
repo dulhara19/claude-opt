@@ -1,12 +1,35 @@
 import type { PredictionResult as _PredictionResult } from '../predictor/types.js';
 import type { RoutingResult as _RoutingResult } from '../router/types.js';
 import type { CompressionResult as _CompressionResult } from '../compressor/types.js';
+import type {
+  Config,
+  ProjectMap,
+  DependencyGraph,
+  TaskHistory,
+  Patterns,
+  Metrics,
+  KeywordIndex,
+} from './store.js';
 
 /**
  * Result type for operations that can fail.
  * Follows the pattern: { ok: true; value: T } | { ok: false; error: string }
  */
 export type Result<T> = { ok: true; value: T } | { ok: false; error: string };
+
+/**
+ * Cached store data, loaded once per pipeline execution.
+ * Eliminates redundant disk reads across pipeline stages and signals.
+ */
+export interface StoreCache {
+  config?: Config;
+  projectMap?: ProjectMap;
+  dependencyGraph?: DependencyGraph;
+  taskHistory?: TaskHistory;
+  patterns?: Patterns;
+  metrics?: Metrics;
+  keywordIndex?: KeywordIndex;
+}
 
 /**
  * Pipeline context accumulates results across pipeline stages.
@@ -22,6 +45,8 @@ export interface PipelineContext {
   results: Record<string, unknown>;
   /** Timestamp when pipeline started */
   startedAt: number;
+  /** Cached store data — loaded once, shared across all stages */
+  storeCache?: StoreCache;
   /** Classification result from the Task Analyzer */
   classification?: ClassificationResult;
   /** Prediction result from the File Predictor (Story 2.2) */

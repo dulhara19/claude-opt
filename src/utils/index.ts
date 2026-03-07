@@ -1,6 +1,7 @@
 export { toInternal, toOS, normalizePath } from './paths.js';
 export { ok, err, withFailOpen } from './errors.js';
-export { logger, setLogLevel, LogLevel } from './logger.js';
+export { logger, setLogLevel, setLogOutput, LogLevel } from './logger.js';
+export { stem, TASK_ACTION_STOPWORDS } from './stemmer.js';
 export {
   SCHEMA_VERSION,
   DEFAULT_BUDGET,

@@ -8,6 +8,15 @@ export enum LogLevel {
 }
 
 let currentLevel: LogLevel = LogLevel.Info;
+let logOutput: NodeJS.WritableStream = process.stdout;
+
+/**
+ * Redirect debug/info log output to a different stream.
+ * Used by MCP server to keep stdout clean for protocol messages.
+ */
+export function setLogOutput(stream: NodeJS.WritableStream): void {
+  logOutput = stream;
+}
 
 /**
  * Set the global log level.
@@ -32,13 +41,13 @@ function formatMessage(level: string, module: string, message: string, error?: u
 export const logger = {
   debug(module: string, message: string, error?: unknown): void {
     if (currentLevel <= LogLevel.Debug) {
-      process.stdout.write(formatMessage(chalk.gray('DEBUG'), module, message, error));
+      logOutput.write(formatMessage(chalk.gray('DEBUG'), module, message, error));
     }
   },
 
   info(module: string, message: string, error?: unknown): void {
     if (currentLevel <= LogLevel.Info) {
-      process.stdout.write(formatMessage(chalk.blue('INFO'), module, message, error));
+      logOutput.write(formatMessage(chalk.blue('INFO'), module, message, error));
     }
   },
 

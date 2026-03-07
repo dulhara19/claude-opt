@@ -1,5 +1,6 @@
 export type {
   Result,
+  StoreCache,
   PipelineContext,
   ClassificationResult,
   PredictionResult,
@@ -33,6 +34,8 @@ export type {
   TokenWindow,
   PredictionTrendPoint,
   OverallMetrics,
+  SignalAccuracy,
+  ModelPerformance,
   Metrics,
   KeywordIndex,
   Finding,

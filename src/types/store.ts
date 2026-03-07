@@ -202,12 +202,39 @@ export interface OverallMetrics {
   savingsRate: number;
 }
 
+/** Per-signal accuracy tracking for adaptive weight learning (#4). */
+export interface SignalAccuracy {
+  truePositives: number;
+  falsePositives: number;
+  totalPredictions: number;
+}
+
+/** Per-model performance tracking for router learning (#7). */
+export interface ModelPerformance {
+  successes: number;
+  failures: number;
+  totalTasks: number;
+  avgTokenCost: number;
+}
+
 export interface Metrics {
   schemaVersion: string;
   overall: OverallMetrics;
   perDomain: Record<string, DomainMetrics>;
   windows: TokenWindow[];
   predictionTrend: PredictionTrendPoint[];
+  /** Learned signal weights from adaptive weight tuning (#4). */
+  learnedSignalWeights?: Record<string, number>;
+  /** Per-signal accuracy tracking (#4). */
+  signalAccuracy?: Record<string, SignalAccuracy>;
+  /** Per-domain signal accuracy tracking (#9). Key: "domain:signalSource". */
+  domainSignalAccuracy?: Record<string, SignalAccuracy>;
+  /** Per-domain learned signal weights (#9). Key: domain name. */
+  domainSignalWeights?: Record<string, Record<string, number>>;
+  /** Learned confidence thresholds per task type (#6). */
+  learnedThresholds?: Record<string, number>;
+  /** Model performance per model×taskType×complexity key (#7). */
+  modelPerformance?: Record<string, ModelPerformance>;
 }
 
 // ─── keyword-index.json ────────────────────────────────────────
