@@ -124,6 +124,7 @@ export function detectConventions(projectMap: ProjectMap): Convention[] {
 // ─── CLAUDE.md content building ───────────────────────────────
 
 function buildClaudeMdContent(
+  projectRoot: string,
   projectMap: ProjectMap,
   depGraph: DependencyGraph,
   conventions: Convention[],
@@ -222,6 +223,32 @@ function buildClaudeMdContent(
     lines.push('');
   }
 
+  // ── MCP Optimizer Tools ──
+  const mcpJsonPath = path.join(toOS(projectRoot), '.mcp.json');
+  if (existsSync(mcpJsonPath)) {
+    try {
+      const mcpConfig = JSON.parse(readFileSync(mcpJsonPath, 'utf-8'));
+      if (mcpConfig?.mcpServers?.['claude-opt']) {
+        lines.push('## Optimizer Tools (MCP)');
+        lines.push('');
+        lines.push('You have access to these optimization tools:');
+        lines.push('- **co_predict** — Predict relevant files for a task. Call before exploring.');
+        lines.push('- **co_classify** — Get task type, domain, and complexity.');
+        lines.push('- **co_suggest_model** — Get recommended model tier.');
+        lines.push('- **co_compress** — Run full optimization pipeline on a prompt.');
+        lines.push('- **co_stats** — View prediction accuracy and token savings stats.');
+        lines.push('- **co_scan** — Re-scan the project and update CLAUDE.md.');
+        lines.push('- **co_doctor** — Run optimizer health diagnostics.');
+        lines.push('- **co_feedback** — Report task outcome to improve future predictions.');
+        lines.push('');
+        lines.push('Suggested: Call co_predict when starting complex tasks to focus file exploration.');
+        lines.push('');
+      }
+    } catch {
+      // Ignore MCP config parse errors
+    }
+  }
+
   return lines.join('\n');
 }
 
@@ -254,7 +281,7 @@ export function generateClaudeMd(
   depGraph: DependencyGraph,
 ): Result<void> {
   const conventions = detectConventions(projectMap);
-  const generatedContent = buildClaudeMdContent(projectMap, depGraph, conventions);
+  const generatedContent = buildClaudeMdContent(projectRoot, projectMap, depGraph, conventions);
 
   const claudeMdPath = path.join(toOS(projectRoot), 'CLAUDE.md');
 

@@ -73,7 +73,21 @@ export class TypeScriptParser implements ImportParser {
     const keywords: string[] = [];
 
     for (const match of content.matchAll(EXPORT_KEYWORD_RE)) {
-      keywords.push(match[1].toLowerCase());
+      const name = match[1];
+      // Add the full name
+      keywords.push(name.toLowerCase());
+      // Split camelCase/PascalCase into component words for semantic matching
+      const parts = name
+        .replace(/([a-z])([A-Z])/g, '$1 $2')
+        .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
+        .toLowerCase()
+        .split(/\s+/)
+        .filter((w) => w.length > 2);
+      for (const part of parts) {
+        if (part !== name.toLowerCase()) {
+          keywords.push(part);
+        }
+      }
     }
 
     return keywords;
