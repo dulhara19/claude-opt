@@ -12,6 +12,9 @@ import {
 } from './types.js';
 import { detectPatterns } from './pattern-detector.js';
 import { runWeightCorrection } from './weight-correction.js';
+import { updateSignalAccuracy, updateLearnedWeights, updateDomainSignalAccuracy, updateDomainLearnedWeights } from './signal-weight-learner.js';
+import { updateLearnedThresholds } from './threshold-learner.js';
+import { updateModelPerformance } from './router-learner.js';
 
 const MODULE = 'learner';
 
@@ -419,6 +422,46 @@ export function captureOutcome(ctx: PipelineContext): void {
       }
     } catch (error) {
       logger.warn(MODULE, 'Pattern detection failed (fail-open)', error);
+    }
+
+    // Adaptive signal weight learning (#4) + threshold learning (#6) + router learning (#7)
+    try {
+      const metricsForLearning = readMetrics(projectRoot);
+      if (metricsForLearning.ok) {
+        const m = metricsForLearning.value;
+        const actualFileSet = new Set(actualFiles.map(toInternal));
+        const predictions = ctx.prediction?.predictions ?? [];
+
+        // #4: Update per-signal accuracy and learned weights
+        updateSignalAccuracy(m, predictions, actualFileSet);
+        updateLearnedWeights(m);
+
+        // #9: Update per-domain signal accuracy and weights
+        const taskDomain = ctx.classification?.domain ?? 'unknown';
+        updateDomainSignalAccuracy(m, predictions, actualFileSet, taskDomain);
+        updateDomainLearnedWeights(m, taskDomain);
+
+        // #6: Update learned confidence thresholds per task type
+        const historyForThresholds = readTaskHistory(projectRoot);
+        if (historyForThresholds.ok) {
+          updateLearnedThresholds(m, historyForThresholds.value);
+        }
+
+        // #7: Update model performance tracking
+        const taskType = ctx.classification?.type ?? 'Unknown';
+        const complexity = ctx.classification?.complexity ?? 'Medium';
+        const model = ctx.routing?.model ?? 'sonnet';
+        const isSuccess = accuracy.precision >= 0.3;
+        const tokenCost = entry.tokens.consumed;
+        updateModelPerformance(m, model, taskType, complexity, isSuccess, tokenCost);
+
+        const writeResult = writeMetrics(projectRoot, m);
+        if (!writeResult.ok) {
+          logger.warn(MODULE, `Failed to write adaptive metrics: ${writeResult.error}`);
+        }
+      }
+    } catch (error) {
+      logger.warn(MODULE, 'Adaptive learning failed (fail-open)', error);
     }
 
     // Run weight corrections (Story 3.3)

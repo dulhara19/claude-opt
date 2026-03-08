@@ -11,3 +11,6 @@ export {
 } from './types.js';
 export { detectPatterns, detectCoOccurrences, detectTypeAffinities, detectConventions } from './pattern-detector.js';
 export { correctWeights, applyWeightCorrections, applyWeightToPatterns, decayStaleEntries, runWeightCorrection } from './weight-correction.js';
+export { updateSignalAccuracy, updateLearnedWeights, resolveSignalWeights, updateDomainSignalAccuracy, updateDomainLearnedWeights } from './signal-weight-learner.js';
+export { updateLearnedThresholds } from './threshold-learner.js';
+export { updateModelPerformance, selectLearnedModel, MIN_OBSERVATIONS } from './router-learner.js';
