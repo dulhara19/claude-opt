@@ -1,4 +1,4 @@
-import type { PipelineContext, ClassificationResult, ProjectMap, KeywordIndex } from './types/index.js';
+import type { PipelineContext, ClassificationResult, StoreCache, ProjectMap, KeywordIndex } from './types/index.js';
 import type { PredictionResult } from './predictor/index.js';
 import { withFailOpen, logger, CONFIDENCE_THRESHOLD } from './utils/index.js';
 import { classifyTask, DEFAULT_CLASSIFICATION } from './analyzer/index.js';
@@ -6,12 +6,13 @@ import { predictFiles } from './predictor/index.js';
 import { selectModel, DEFAULT_ROUTING } from './router/index.js';
 import { compressPrompt, DEFAULT_COMPRESSION, reviewPrompt, ReviewAction } from './compressor/index.js';
 import type { ReviewResult } from './compressor/index.js';
-import { readProjectMap, readKeywordIndex, readConfig, readMetrics, readTaskHistory } from './store/index.js';
+import { readProjectMap, readKeywordIndex, readConfig, readMetrics, readTaskHistory, readPatterns, readDependencyGraph } from './store/index.js';
 import { showInlineFeedback, recordFeedback } from './visibility/index.js';
+import { captureOutcome } from './learner/index.js';
 import type { TaskSummary } from './visibility/index.js';
 import { executeTaskFailOpen } from './adapter/index.js';
-import { getActiveWindow, getWindowStatus, createWindow } from './tracker/index.js';
-import type { WindowEntry } from './tracker/types.js';
+import { getActiveWindow, getWindowStatus, createWindow, trackUsage } from './tracker/index.js';
+import type { WindowEntry, TrackingResult } from './tracker/types.js';
 import { checkBudget, promptBudgetWarning } from './tracker/budget-warnings.js';
 import { checkThresholds, runSupervised } from './doctor/supervised.js';
 import { runAutonomous } from './doctor/autonomous.js';
@@ -20,31 +21,59 @@ import { DOCTOR_ACCURACY_THRESHOLD } from './utils/index.js';
 const MODULE = 'pipeline';
 
 /**
+ * Load all store files once into a StoreCache.
+ * Each read is fail-open — missing files result in undefined cache entries.
+ */
+function loadStoreCache(workingDir: string): StoreCache {
+  const configResult = readConfig(workingDir);
+  const projectMapResult = readProjectMap(workingDir);
+  const dependencyGraphResult = readDependencyGraph(workingDir);
+  const taskHistoryResult = readTaskHistory(workingDir);
+  const patternsResult = readPatterns(workingDir);
+  const metricsResult = readMetrics(workingDir);
+  const keywordIndexResult = readKeywordIndex(workingDir);
+
+  return {
+    config: configResult.ok ? configResult.value : undefined,
+    projectMap: projectMapResult.ok ? projectMapResult.value : undefined,
+    dependencyGraph: dependencyGraphResult.ok ? dependencyGraphResult.value : undefined,
+    taskHistory: taskHistoryResult.ok ? taskHistoryResult.value : undefined,
+    patterns: patternsResult.ok ? patternsResult.value : undefined,
+    metrics: metricsResult.ok ? metricsResult.value : undefined,
+    keywordIndex: keywordIndexResult.ok ? keywordIndexResult.value : undefined,
+  };
+}
+
+/**
  * Create an initial PipelineContext from a user prompt.
  */
 function createContext(userPrompt: string, workingDir: string, isDryRun: boolean): PipelineContext {
+  const storeCache = loadStoreCache(workingDir);
+
   return {
     taskText: userPrompt,
     workingDir,
     isDryRun,
     results: {},
     startedAt: Date.now(),
+    storeCache,
   };
 }
 
 /**
  * Pipeline stage: Analyze task (classify type, domain, complexity).
- * Synchronous — pure keyword matching.
+ * Synchronous — keyword matching + learned pattern lookup.
  */
 function analyzeStage(ctx: PipelineContext): PipelineContext {
-  // Try to read project map and keyword index for domain classification
-  const projectMapResult = readProjectMap(ctx.workingDir);
-  const keywordIndexResult = readKeywordIndex(ctx.workingDir);
+  const cache = ctx.storeCache;
 
-  const projectMap: ProjectMap | undefined = projectMapResult.ok ? projectMapResult.value : undefined;
-  const keywordIndex: KeywordIndex | undefined = keywordIndexResult.ok ? keywordIndexResult.value : undefined;
-
-  const classification: ClassificationResult = classifyTask(ctx.taskText, projectMap, keywordIndex);
+  const classification: ClassificationResult = classifyTask(
+    ctx.taskText,
+    cache?.projectMap,
+    cache?.keywordIndex,
+    cache?.patterns,
+    cache?.metrics,
+  );
 
   return { ...ctx, classification };
 }
@@ -156,12 +185,11 @@ export async function runPipeline(
   // Stage 5: Budget check (fail-open — warning failure never blocks task)
   const budgetCheckResult = withFailOpen(
     () => {
-      const cfgResult = readConfig(ctx.workingDir);
-      const metricsResult = readMetrics(ctx.workingDir);
-      if (!cfgResult.ok || !metricsResult.ok) return null;
+      const cfg = ctx.storeCache?.config;
+      const metrics = ctx.storeCache?.metrics;
+      if (!cfg || !metrics) return null;
 
-      const cfg = cfgResult.value;
-      const windows = (metricsResult.value.windows as unknown as WindowEntry[]) ?? [];
+      const windows = (metrics.windows as unknown as WindowEntry[]) ?? [];
       let activeWindow = getActiveWindow(windows);
       if (!activeWindow) {
         activeWindow = createWindow(windows, cfg.windowDurationMs, cfg.tokenBudget);
@@ -199,11 +227,12 @@ export async function runPipeline(
     ctx = reviewedCtx;
 
     // If cancelled, abort pipeline immediately — no tokens consumed
+    // RV13: cancelledByUser flag preserved on context for learning pipeline
     if (review.action === ReviewAction.Cancel) {
       logger.info(MODULE, 'Pipeline aborted: user cancelled at review stage');
       const elapsed = performance.now() - startTime;
       logger.info(MODULE, `Pipeline cancelled after ${elapsed.toFixed(0)}ms`);
-      return ctx;
+      return { ...ctx, results: { ...ctx.results, cancelledByUser: true } };
     }
   } catch (error) {
     logger.error(MODULE, 'Review stage failed', error);
@@ -221,7 +250,63 @@ export async function runPipeline(
     }
   }
 
-  // Stage 8: Inline feedback (async, fail-open — feedback failure never blocks pipeline)
+  // Stage 8: Track token usage (sync, fail-open)
+  let trackingResult: TrackingResult | undefined;
+  if (!isDryRun && ctx.adapterResult) {
+    const tracked = withFailOpen(
+      () => {
+        const tokensUsed = ctx.adapterResult?.tokenEstimate ?? 0;
+        if (tokensUsed === 0) return undefined;
+
+        const taskId = `t_${new Date().toISOString().slice(0, 10).replace(/-/g, '')}_${Date.now() % 1000}`;
+        const domain = ctx.classification?.domain ?? 'unknown';
+        const predictionConfidence = ctx.classification?.confidence ?? 0;
+        const compressionRatio = ctx.compression
+          ? 1 - ctx.compression.compressedLength / ctx.compression.originalLength
+          : 0;
+
+        const result = trackUsage({
+          taskId,
+          tokensUsed,
+          domain,
+          predictionConfidence,
+          compressionRatio,
+          projectRoot: ctx.workingDir,
+        });
+
+        if (result.ok) return result.value;
+        return undefined;
+      },
+      undefined,
+      MODULE,
+    );
+
+    if (tracked) {
+      trackingResult = tracked;
+      const u = tracked.usage;
+      const s = tracked.sessionStats;
+      logger.info(MODULE, [
+        `Tokens: ${u.tokensUsed.toLocaleString()} used`,
+        `${u.estimatedUnoptimized.toLocaleString()} estimated without opt`,
+        `${u.savings.toLocaleString()} saved (${(tracked.usage.savings / Math.max(u.estimatedUnoptimized, 1) * 100).toFixed(0)}%)`,
+      ].join(' | '));
+      logger.info(MODULE, `Session total: ${s.tokensConsumed.toLocaleString()} consumed, ${s.tokensSaved.toLocaleString()} saved across ${s.tasksCompleted} task(s)`);
+    }
+  }
+
+  // Stage 9: Capture outcome for learning (sync, fail-open)
+  if (!isDryRun && ctx.adapterResult) {
+    withFailOpen(
+      () => {
+        captureOutcome(ctx);
+        logger.debug(MODULE, 'Outcome captured — learner updated history, metrics, keywords, graph, patterns, weights');
+      },
+      undefined,
+      MODULE,
+    );
+  }
+
+  // Stage 10: Inline feedback (async, fail-open — feedback failure never blocks pipeline)
   if (!isDryRun && ctx.adapterResult) {
     withFailOpen(
       () => {
@@ -253,20 +338,19 @@ export async function runPipeline(
     );
   }
 
-  // Stage 9: Doctor threshold check (supervised/autonomous mode, fail-open)
+  // Stage 11: Doctor threshold check (supervised/autonomous mode, fail-open)
   // Runs after feedback/learner captures outcome — zero token cost for the check itself
   if (!isDryRun) {
     withFailOpen(
       () => {
-        const cfgResult = readConfig(ctx.workingDir);
-        const metricsResult = readMetrics(ctx.workingDir);
-        if (!cfgResult.ok || !metricsResult.ok) return;
-        const cfg = cfgResult.value;
+        const cfg = ctx.storeCache?.config;
+        const metrics = ctx.storeCache?.metrics;
+        if (!cfg || !metrics) return;
 
         const mode = cfg.doctorMode;
         if (mode !== 'supervised' && mode !== 'autonomous') return;
 
-        const alerts = checkThresholds(metricsResult.value, cfg.doctorThreshold ?? DOCTOR_ACCURACY_THRESHOLD);
+        const alerts = checkThresholds(metrics, cfg.doctorThreshold ?? DOCTOR_ACCURACY_THRESHOLD);
         if (alerts.length > 0) {
           if (mode === 'supervised') {
             runSupervised(alerts, ctx.workingDir).catch((doctorErr) => {

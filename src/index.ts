@@ -1,13 +1,13 @@
 import { Command } from 'commander';
 import { createRequire } from 'node:module';
 import { createInterface } from 'node:readline';
-import { existsSync } from 'node:fs';
+import { existsSync, writeFileSync, readFileSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
 import chalk from 'chalk';
 import { runCheckup, handleCheckupInteraction, runDiagnostics, renderDiagnosticReport } from './doctor/index.js';
 import { STORE_DIR, setLogLevel, LogLevel, logger } from './utils/index.js';
 import { runPipeline } from './pipeline.js';
-import { initializeStore, ensureStoreDir, resolveStorePath, readDependencyGraph, readConfig, writeConfig } from './store/index.js';
+import { initializeStore, ensureStoreDir, resolveStorePath, readDependencyGraph, readProjectMap, readConfig, writeConfig } from './store/index.js';
 import { scanProject, generateClaudeMd } from './scanner/index.js';
 import { detectProjectStack, loadStarterPack, applyStarterPack } from './scanner/starter-packs.js';
 import { registerVisibilityCommands, runDryRunCommand, forgetFile, runCorrectCommand } from './visibility/index.js';
@@ -434,6 +434,119 @@ program
     console.log(`  - Zeroed weight in ${r.affinitiesZeroed} type affinity map(s)`);
     console.log(`  - Will not be predicted unless re-discovered`);
     console.log(chalk.dim('\nUndo? Run: co scan (re-indexes if file still exists)'));
+  });
+
+program
+  .command('mcp-server')
+  .description('Start MCP server for Claude Code integration')
+  .action(async () => {
+    const { startServer } = await import('./mcp/server.js');
+    await startServer();
+  });
+
+program
+  .command('setup')
+  .description('Configure project for Claude Code MCP + hooks integration')
+  .option('--no-hooks', 'Skip hook configuration')
+  .option('--no-mcp', 'Skip MCP server configuration')
+  .action(async (options: { hooks?: boolean; mcp?: boolean }) => {
+    const projectRoot = process.cwd();
+    const storePath = resolveStorePath(projectRoot);
+    const steps: string[] = [];
+
+    console.log(chalk.bold('Setting up Claude Code integration...\n'));
+
+    // Step 1: Initialize if needed
+    if (!existsSync(storePath)) {
+      console.log(chalk.dim('[1/4]') + ' Initializing claude-opt...');
+      await runInit(projectRoot, { force: false });
+      steps.push('Initialized claude-opt store');
+    } else {
+      console.log(chalk.dim('[1/4]') + ' Store already initialized ' + chalk.green('✓'));
+      steps.push('Store already initialized');
+    }
+
+    // Step 2: Write/merge .mcp.json
+    if (options.mcp !== false) {
+      console.log(chalk.dim('[2/4]') + ' Configuring MCP server...');
+      const mcpJsonPath = path.join(projectRoot, '.mcp.json');
+      let mcpConfig: Record<string, unknown> = {};
+      if (existsSync(mcpJsonPath)) {
+        try {
+          mcpConfig = JSON.parse(readFileSync(mcpJsonPath, 'utf-8'));
+        } catch {
+          // Start fresh if parse fails
+        }
+      }
+      // Resolve the optimizer's own dist directory (where this CLI is installed)
+      const cliDir = path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'));
+      const mcpServerPath = path.join(cliDir, 'mcp', 'server.js');
+      const mcpServers = (mcpConfig.mcpServers ?? {}) as Record<string, unknown>;
+      mcpServers['claude-opt'] = {
+        command: 'node',
+        args: [mcpServerPath],
+        env: { PROJECT_ROOT: projectRoot },
+      };
+      mcpConfig.mcpServers = mcpServers;
+      writeFileSync(mcpJsonPath, JSON.stringify(mcpConfig, null, 2) + '\n', 'utf-8');
+      steps.push('Wrote .mcp.json with claude-opt server');
+      console.log('  ' + chalk.green('done'));
+    } else {
+      console.log(chalk.dim('[2/4]') + ' MCP configuration ' + chalk.yellow('skipped'));
+    }
+
+    // Step 3: Write/merge .claude/settings.json with hook
+    if (options.hooks !== false) {
+      console.log(chalk.dim('[3/4]') + ' Configuring UserPromptSubmit hook...');
+      const claudeDir = path.join(projectRoot, '.claude');
+      mkdirSync(claudeDir, { recursive: true });
+      const settingsPath = path.join(claudeDir, 'settings.json');
+      let settings: Record<string, unknown> = {};
+      if (existsSync(settingsPath)) {
+        try {
+          settings = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+        } catch {
+          // Start fresh if parse fails
+        }
+      }
+      const hooks = (settings.hooks ?? {}) as Record<string, unknown>;
+      const cliDir2 = path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'));
+      const hookCommand = `node ${path.join(cliDir2, 'hooks', 'user-prompt-submit.js')}`;
+      hooks['UserPromptSubmit'] = [
+        {
+          matcher: "",
+          hooks: [{ type: 'command', command: hookCommand, timeout: 5000 }],
+        },
+      ];
+      settings.hooks = hooks;
+      writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n', 'utf-8');
+      steps.push('Wrote .claude/settings.json with UserPromptSubmit hook');
+      console.log('  ' + chalk.green('done'));
+    } else {
+      console.log(chalk.dim('[3/4]') + ' Hook configuration ' + chalk.yellow('skipped'));
+    }
+
+    // Step 4: Regenerate CLAUDE.md with MCP instructions
+    console.log(chalk.dim('[4/4]') + ' Updating CLAUDE.md with MCP instructions...');
+    const graphResult = readDependencyGraph(projectRoot);
+    const depGraph = graphResult.ok
+      ? graphResult.value
+      : { schemaVersion: '1.0.0', updatedAt: '', edges: [], adjacency: {} };
+    const mapResult = readProjectMap(projectRoot);
+    if (mapResult.ok) {
+      generateClaudeMd(projectRoot, mapResult.value, depGraph);
+      steps.push('Updated CLAUDE.md with MCP tool instructions');
+      console.log('  ' + chalk.green('done'));
+    } else {
+      console.log('  ' + chalk.yellow('skipped (no project map — run co init first)'));
+    }
+
+    // Summary
+    console.log('\n' + chalk.green.bold('Setup complete!'));
+    for (const step of steps) {
+      console.log(chalk.dim('  •') + ' ' + step);
+    }
+    console.log('\n' + chalk.dim('Next: build with `npm run build`, then start `claude` — MCP tools will be available.'));
   });
 
 program.parse();
