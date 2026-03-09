@@ -47,4 +47,6 @@ export interface ReviewResult {
   action: ReviewAction;
   finalPrompt: string;
   wasEdited: boolean;
+  /** RV13: True when user explicitly cancelled — signal for learning pipeline. */
+  cancelledByUser?: boolean;
 }
