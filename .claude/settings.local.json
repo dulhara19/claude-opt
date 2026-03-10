@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:www.npmjs.com)",
+      "Bash(npm init:*)",
+      "Bash(npm i:*)",
+      "Bash(npx vitest:*)",
+      "Bash(npx tsc:*)",
+      "Bash(npm run:*)",
+      "Bash(npm install:*)",
+      "Bash(npm test:*)",
+      "Bash(node:*)",
+      "Bash(GIT_AUTHOR_DATE=\"2026-03-10T09:00:00+0530\" GIT_COMMITTER_DATE=\"2026-03-10T09:00:00+0530\" git:*)",
+      "Bash(GIT_AUTHOR_DATE=\"2026-03-10T12:30:00+0530\" GIT_COMMITTER_DATE=\"2026-03-10T12:30:00+0530\" git:*)"
+    ]
+  }
+}

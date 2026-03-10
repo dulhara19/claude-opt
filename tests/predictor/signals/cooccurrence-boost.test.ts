@@ -1,36 +1,22 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import { scoreCooccurrenceBoost } from '../../../src/predictor/signals/cooccurrence-boost.js';
-import { createTempProjectRoot, cleanupTempProjectRoot } from '../../helpers/test-store.js';
-import { initializeStore, writePatterns } from '../../../src/store/index.js';
 import { createDefaultPatterns } from '../../../src/store/defaults.js';
 
 describe('scoreCooccurrenceBoost', () => {
-  let projectRoot: string;
-
-  beforeEach(() => {
-    projectRoot = createTempProjectRoot();
-    initializeStore(projectRoot);
-  });
-
-  afterEach(() => {
-    cleanupTempProjectRoot(projectRoot);
-  });
-
   it('returns empty map when no patterns exist', () => {
     const scores = scoreCooccurrenceBoost(
       new Set(['src/auth/login.ts']),
-      '/nonexistent/path',
+      undefined,
     );
     expect(scores.size).toBe(0);
   });
 
   it('returns empty map when no co-occurrences exist', () => {
     const patterns = createDefaultPatterns();
-    writePatterns(projectRoot, patterns);
 
     const scores = scoreCooccurrenceBoost(
       new Set(['src/auth/login.ts']),
-      projectRoot,
+      patterns,
     );
     expect(scores.size).toBe(0);
   });
@@ -40,10 +26,9 @@ describe('scoreCooccurrenceBoost', () => {
     patterns.coOccurrences = [
       { files: ['src/auth/login.ts', 'src/auth/login.test.ts'], count: 10, confidence: 0.9 },
     ];
-    writePatterns(projectRoot, patterns);
 
     const predicted = new Set(['src/auth/login.ts']);
-    const scores = scoreCooccurrenceBoost(predicted, projectRoot);
+    const scores = scoreCooccurrenceBoost(predicted, patterns);
 
     expect(scores.has('src/auth/login.test.ts')).toBe(true);
   });
@@ -53,10 +38,9 @@ describe('scoreCooccurrenceBoost', () => {
     patterns.coOccurrences = [
       { files: ['src/auth/login.ts', 'src/auth/login.test.ts'], count: 10, confidence: 0.9 },
     ];
-    writePatterns(projectRoot, patterns);
 
     const predicted = new Set(['src/auth/login.ts', 'src/auth/login.test.ts']);
-    const scores = scoreCooccurrenceBoost(predicted, projectRoot);
+    const scores = scoreCooccurrenceBoost(predicted, patterns);
 
     // Both are already predicted, no new files to boost
     expect(scores.size).toBe(0);
@@ -67,11 +51,10 @@ describe('scoreCooccurrenceBoost', () => {
     patterns.coOccurrences = [
       { files: ['src/auth/login.ts', 'src/auth/register.ts'], count: 5, confidence: 0.7 },
     ];
-    writePatterns(projectRoot, patterns);
 
-    // Predict register.ts → should boost login.ts
+    // Predict register.ts -> should boost login.ts
     const predicted = new Set(['src/auth/register.ts']);
-    const scores = scoreCooccurrenceBoost(predicted, projectRoot);
+    const scores = scoreCooccurrenceBoost(predicted, patterns);
 
     expect(scores.has('src/auth/login.ts')).toBe(true);
   });
@@ -82,10 +65,9 @@ describe('scoreCooccurrenceBoost', () => {
       { files: ['src/a.ts', 'src/b.ts'], count: 10, confidence: 0.9 },
       { files: ['src/a.ts', 'src/c.ts'], count: 3, confidence: 0.3 },
     ];
-    writePatterns(projectRoot, patterns);
 
     const predicted = new Set(['src/a.ts']);
-    const scores = scoreCooccurrenceBoost(predicted, projectRoot);
+    const scores = scoreCooccurrenceBoost(predicted, patterns);
 
     for (const score of scores.values()) {
       expect(score.score).toBeGreaterThanOrEqual(0);
@@ -98,9 +80,8 @@ describe('scoreCooccurrenceBoost', () => {
     patterns.coOccurrences = [
       { files: ['src/a.ts', 'src/b.ts'], count: 10, confidence: 0.9 },
     ];
-    writePatterns(projectRoot, patterns);
 
-    const scores = scoreCooccurrenceBoost(new Set(), projectRoot);
+    const scores = scoreCooccurrenceBoost(new Set(), patterns);
     expect(scores.size).toBe(0);
   });
 
@@ -109,10 +90,9 @@ describe('scoreCooccurrenceBoost', () => {
     patterns.coOccurrences = [
       { files: ['src/a.ts', 'src/b.ts'], count: 10, confidence: 0.9 },
     ];
-    writePatterns(projectRoot, patterns);
 
     const predicted = new Set(['src/a.ts']);
-    const scores = scoreCooccurrenceBoost(predicted, projectRoot);
+    const scores = scoreCooccurrenceBoost(predicted, patterns);
 
     for (const score of scores.values()) {
       expect(score.source).toBe('CooccurrenceBoost');

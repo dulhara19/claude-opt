@@ -1,16 +1,8 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import { predictFiles } from '../../src/predictor/file-predictor.js';
-import type { PipelineContext } from '../../src/types/index.js';
+import type { PipelineContext, StoreCache } from '../../src/types/index.js';
 import { TaskType, Complexity } from '../../src/types/index.js';
 import { CONFIDENCE_THRESHOLD } from '../../src/utils/constants.js';
-import { createTempProjectRoot, cleanupTempProjectRoot } from '../helpers/test-store.js';
-import {
-  initializeStore,
-  writeTaskHistory,
-  writeDependencyGraph,
-  writeKeywordIndex,
-  writePatterns,
-} from '../../src/store/index.js';
 import {
   createDefaultTaskHistory,
   createDefaultDependencyGraph,
@@ -18,13 +10,14 @@ import {
   createDefaultPatterns,
 } from '../../src/store/defaults.js';
 
-function makeContext(taskText: string, workingDir: string): PipelineContext {
+function makeContext(taskText: string, storeCache?: StoreCache): PipelineContext {
   return {
     taskText,
-    workingDir,
+    workingDir: '/tmp/test',
     isDryRun: true,
     results: {},
     startedAt: Date.now(),
+    storeCache,
     classification: {
       type: TaskType.Feature,
       domain: 'auth',
@@ -35,19 +28,8 @@ function makeContext(taskText: string, workingDir: string): PipelineContext {
 }
 
 describe('predictFiles', () => {
-  let projectRoot: string;
-
-  beforeEach(() => {
-    projectRoot = createTempProjectRoot();
-    initializeStore(projectRoot);
-  });
-
-  afterEach(() => {
-    cleanupTempProjectRoot(projectRoot);
-  });
-
   it('returns a valid PredictionResult structure', () => {
-    const ctx = makeContext('fix the auth login bug', projectRoot);
+    const ctx = makeContext('fix the auth login bug');
     const result = predictFiles(ctx);
 
     expect(result).toHaveProperty('predictions');
@@ -60,7 +42,7 @@ describe('predictFiles', () => {
   });
 
   it('returns empty predictions when no store data exists', () => {
-    const ctx = makeContext('fix the auth login bug', projectRoot);
+    const ctx = makeContext('fix the auth login bug');
     const result = predictFiles(ctx);
 
     expect(result.predictions).toHaveLength(0);
@@ -68,14 +50,14 @@ describe('predictFiles', () => {
   });
 
   it('returns empty predictions when task has no extractable keywords', () => {
-    const ctx = makeContext('a b', projectRoot);
+    const ctx = makeContext('a b');
     const result = predictFiles(ctx);
 
     expect(result.predictions).toHaveLength(0);
   });
 
   describe('with keyword index data', () => {
-    beforeEach(() => {
+    function makeKeywordCache(): StoreCache {
       const keywordIndex = createDefaultKeywordIndex();
       keywordIndex.keywordToFiles = {
         auth: ['src/auth/login.ts', 'src/auth/register.ts'],
@@ -92,11 +74,11 @@ describe('predictFiles', () => {
         'src/db/connection.ts': ['database'],
         'src/ui/button.tsx': ['component'],
       };
-      writeKeywordIndex(projectRoot, keywordIndex);
-    });
+      return { keywordIndex };
+    }
 
     it('predicts files that match task keywords', () => {
-      const ctx = makeContext('fix the auth login flow', projectRoot);
+      const ctx = makeContext('fix the auth login flow', makeKeywordCache());
       const result = predictFiles(ctx);
 
       expect(result.totalCandidates).toBeGreaterThan(0);
@@ -110,7 +92,7 @@ describe('predictFiles', () => {
     });
 
     it('returns predictions sorted by score descending', () => {
-      const ctx = makeContext('fix the auth login user flow', projectRoot);
+      const ctx = makeContext('fix the auth login user flow', makeKeywordCache());
       const result = predictFiles(ctx);
 
       for (let i = 1; i < result.predictions.length; i++) {
@@ -121,7 +103,7 @@ describe('predictFiles', () => {
     });
 
     it('excludes files below confidence threshold', () => {
-      const ctx = makeContext('fix the auth login flow', projectRoot);
+      const ctx = makeContext('fix the auth login flow', makeKeywordCache());
       const result = predictFiles(ctx);
 
       for (const prediction of result.predictions) {
@@ -130,7 +112,7 @@ describe('predictFiles', () => {
     });
 
     it('each prediction has a composite score between 0.0 and 1.0', () => {
-      const ctx = makeContext('fix the auth login user flow', projectRoot);
+      const ctx = makeContext('fix the auth login user flow', makeKeywordCache());
       const result = predictFiles(ctx);
 
       for (const prediction of result.predictions) {
@@ -140,7 +122,7 @@ describe('predictFiles', () => {
     });
 
     it('each prediction includes signal breakdown', () => {
-      const ctx = makeContext('fix the auth login flow', projectRoot);
+      const ctx = makeContext('fix the auth login flow', makeKeywordCache());
       const result = predictFiles(ctx);
 
       for (const prediction of result.predictions) {
@@ -157,8 +139,7 @@ describe('predictFiles', () => {
   });
 
   describe('cold start handling', () => {
-    beforeEach(() => {
-      // Set up keyword index but NO task history
+    function makeColdStartCache(): StoreCache {
       const keywordIndex = createDefaultKeywordIndex();
       keywordIndex.keywordToFiles = {
         auth: ['src/auth/login.ts'],
@@ -167,11 +148,11 @@ describe('predictFiles', () => {
       keywordIndex.fileToKeywords = {
         'src/auth/login.ts': ['auth', 'login'],
       };
-      writeKeywordIndex(projectRoot, keywordIndex);
-    });
+      return { keywordIndex };
+    }
 
     it('produces predictions on cold start using keyword and graph signals', () => {
-      const ctx = makeContext('fix the auth login bug', projectRoot);
+      const ctx = makeContext('fix the auth login bug', makeColdStartCache());
       const result = predictFiles(ctx);
 
       // Should still produce results via keyword lookup
@@ -179,7 +160,7 @@ describe('predictFiles', () => {
     });
 
     it('does not use history signal on cold start', () => {
-      const ctx = makeContext('fix the auth login bug', projectRoot);
+      const ctx = makeContext('fix the auth login bug', makeColdStartCache());
       const result = predictFiles(ctx);
 
       // History signal weight should be 0 on cold start
@@ -196,11 +177,11 @@ describe('predictFiles', () => {
 
   describe('graceful degradation', () => {
     it('returns empty prediction list when all candidates are below threshold', () => {
-      // With no store data, all signals return empty → no candidates
-      const ctx = makeContext('fix the auth login bug', projectRoot);
+      // With no store data, all signals return empty -> no candidates
+      const ctx = makeContext('fix the auth login bug');
       const result = predictFiles(ctx);
 
-      // No candidates above threshold → graceful degradation
+      // No candidates above threshold -> graceful degradation
       expect(result.predictions).toHaveLength(0);
     });
 
@@ -212,9 +193,8 @@ describe('predictFiles', () => {
       keywordIndex.fileToKeywords = {
         'src/auth/login.ts': ['auth'],
       };
-      writeKeywordIndex(projectRoot, keywordIndex);
 
-      const ctx = makeContext('fix the auth issue', projectRoot);
+      const ctx = makeContext('fix the auth issue', { keywordIndex });
       const result = predictFiles(ctx);
 
       for (const prediction of result.predictions) {
@@ -224,7 +204,7 @@ describe('predictFiles', () => {
   });
 
   describe('dual content type support', () => {
-    beforeEach(() => {
+    function makeDualContentCache(): StoreCache {
       const keywordIndex = createDefaultKeywordIndex();
       keywordIndex.keywordToFiles = {
         auth: ['src/auth/login.ts', 'docs/auth-guide.md'],
@@ -236,11 +216,11 @@ describe('predictFiles', () => {
         'README.md': ['setup'],
         'src/config/setup.ts': ['setup'],
       };
-      writeKeywordIndex(projectRoot, keywordIndex);
-    });
+      return { keywordIndex };
+    }
 
     it('considers both code and document files', () => {
-      const ctx = makeContext('fix the auth setup flow', projectRoot);
+      const ctx = makeContext('fix the auth setup flow', makeDualContentCache());
       const result = predictFiles(ctx);
 
       // Both .ts and .md files should be candidates
@@ -259,9 +239,8 @@ describe('predictFiles', () => {
         keywordIndex.keywordToFiles[`keyword${i}`] = [`src/file${i}.ts`];
         keywordIndex.fileToKeywords[`src/file${i}.ts`] = [`keyword${i}`];
       }
-      writeKeywordIndex(projectRoot, keywordIndex);
 
-      const ctx = makeContext('fix keyword0 keyword1 keyword2 keyword3', projectRoot);
+      const ctx = makeContext('fix keyword0 keyword1 keyword2 keyword3', { keywordIndex });
       const result = predictFiles(ctx);
 
       expect(result.durationMs).toBeLessThan(200);
@@ -269,7 +248,7 @@ describe('predictFiles', () => {
   });
 
   describe('multi-signal scoring', () => {
-    beforeEach(() => {
+    function makeMultiSignalCache(): StoreCache {
       // Set up keyword index
       const keywordIndex = createDefaultKeywordIndex();
       keywordIndex.keywordToFiles = {
@@ -282,11 +261,10 @@ describe('predictFiles', () => {
         'src/auth/register.ts': ['auth'],
         'src/models/user.ts': ['user'],
       };
-      writeKeywordIndex(projectRoot, keywordIndex);
 
       // Set up dependency graph
-      const depGraph = createDefaultDependencyGraph();
-      depGraph.adjacency = {
+      const dependencyGraph = createDefaultDependencyGraph();
+      dependencyGraph.adjacency = {
         'src/auth/login.ts': {
           imports: ['src/models/user.ts'],
           importedBy: ['src/pages/login-page.ts'],
@@ -300,12 +278,11 @@ describe('predictFiles', () => {
           importedBy: [],
         },
       };
-      writeDependencyGraph(projectRoot, depGraph);
 
       // Set up task history (above cold start threshold)
-      const history = createDefaultTaskHistory();
+      const taskHistory = createDefaultTaskHistory();
       for (let i = 0; i < 6; i++) {
-        history.tasks.push({
+        taskHistory.tasks.push({
           id: `task-${i}`,
           timestamp: new Date().toISOString(),
           taskText: 'fix the auth login validation',
@@ -321,19 +298,19 @@ describe('predictFiles', () => {
           feedback: null,
         });
       }
-      history.count = history.tasks.length;
-      writeTaskHistory(projectRoot, history);
+      taskHistory.count = taskHistory.tasks.length;
 
       // Set up patterns with co-occurrences
       const patterns = createDefaultPatterns();
       patterns.coOccurrences = [
         { files: ['src/auth/login.ts', 'src/auth/register.ts'], count: 5, confidence: 0.8 },
       ];
-      writePatterns(projectRoot, patterns);
-    });
+
+      return { keywordIndex, dependencyGraph, taskHistory, patterns };
+    }
 
     it('combines multiple signal sources', () => {
-      const ctx = makeContext('fix the auth login bug', projectRoot);
+      const ctx = makeContext('fix the auth login bug', makeMultiSignalCache());
       const result = predictFiles(ctx);
 
       // With history, keyword, graph, and co-occurrence data, we should get predictions
@@ -349,7 +326,7 @@ describe('predictFiles', () => {
     });
 
     it('uses history signal when history is available', () => {
-      const ctx = makeContext('fix the auth login validation', projectRoot);
+      const ctx = makeContext('fix the auth login validation', makeMultiSignalCache());
       const result = predictFiles(ctx);
 
       // Check if any prediction has history similarity signal

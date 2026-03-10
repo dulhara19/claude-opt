@@ -1,23 +1,10 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import { scoreKeywordLookup } from '../../../src/predictor/signals/keyword-lookup.js';
-import { createTempProjectRoot, cleanupTempProjectRoot } from '../../helpers/test-store.js';
-import { initializeStore, writeKeywordIndex } from '../../../src/store/index.js';
 import { createDefaultKeywordIndex } from '../../../src/store/defaults.js';
 
 describe('scoreKeywordLookup', () => {
-  let projectRoot: string;
-
-  beforeEach(() => {
-    projectRoot = createTempProjectRoot();
-    initializeStore(projectRoot);
-  });
-
-  afterEach(() => {
-    cleanupTempProjectRoot(projectRoot);
-  });
-
   it('returns empty map when no keyword index exists', () => {
-    const scores = scoreKeywordLookup(['auth'], '/nonexistent/path');
+    const scores = scoreKeywordLookup(['auth'], undefined);
     expect(scores.size).toBe(0);
   });
 
@@ -25,9 +12,8 @@ describe('scoreKeywordLookup', () => {
     const index = createDefaultKeywordIndex();
     index.keywordToFiles = { database: ['src/db/connection.ts'] };
     index.fileToKeywords = { 'src/db/connection.ts': ['database'] };
-    writeKeywordIndex(projectRoot, index);
 
-    const scores = scoreKeywordLookup(['auth', 'login'], projectRoot);
+    const scores = scoreKeywordLookup(['auth', 'login'], index);
     expect(scores.size).toBe(0);
   });
 
@@ -41,9 +27,8 @@ describe('scoreKeywordLookup', () => {
       'src/auth/login.ts': ['auth', 'login'],
       'src/auth/register.ts': ['auth'],
     };
-    writeKeywordIndex(projectRoot, index);
 
-    const scores = scoreKeywordLookup(['auth', 'login'], projectRoot);
+    const scores = scoreKeywordLookup(['auth', 'login'], index);
     expect(scores.size).toBe(2);
 
     // login.ts matches both keywords, register.ts matches one
@@ -64,9 +49,8 @@ describe('scoreKeywordLookup', () => {
     index.fileToKeywords = {
       'src/auth/login.ts': ['auth', 'login', 'user'],
     };
-    writeKeywordIndex(projectRoot, index);
 
-    const scores = scoreKeywordLookup(['auth', 'login', 'user'], projectRoot);
+    const scores = scoreKeywordLookup(['auth', 'login', 'user'], index);
     const loginScore = scores.get('src/auth/login.ts');
     expect(loginScore).toBeDefined();
     expect(loginScore!.score).toBe(1.0);
@@ -83,9 +67,8 @@ describe('scoreKeywordLookup', () => {
       'src/auth/login.ts': ['auth', 'login'],
       'src/auth/register.ts': ['auth', 'register'],
     };
-    writeKeywordIndex(projectRoot, index);
 
-    const scores = scoreKeywordLookup(['auth', 'login', 'register'], projectRoot);
+    const scores = scoreKeywordLookup(['auth', 'login', 'register'], index);
     for (const score of scores.values()) {
       expect(score.score).toBeGreaterThanOrEqual(0);
       expect(score.score).toBeLessThanOrEqual(1);
@@ -101,9 +84,8 @@ describe('scoreKeywordLookup', () => {
     index.fileToKeywords = {
       'src/auth/login.ts': ['auth', 'login'],
     };
-    writeKeywordIndex(projectRoot, index);
 
-    const scores = scoreKeywordLookup(['auth', 'login'], projectRoot);
+    const scores = scoreKeywordLookup(['auth', 'login'], index);
     const loginScore = scores.get('src/auth/login.ts');
     expect(loginScore).toBeDefined();
     expect(loginScore!.reason).toContain('auth');
@@ -114,9 +96,8 @@ describe('scoreKeywordLookup', () => {
     const index = createDefaultKeywordIndex();
     index.keywordToFiles = { auth: ['src/auth/login.ts'] };
     index.fileToKeywords = { 'src/auth/login.ts': ['auth'] };
-    writeKeywordIndex(projectRoot, index);
 
-    const scores = scoreKeywordLookup(['auth'], projectRoot);
+    const scores = scoreKeywordLookup(['auth'], index);
     for (const score of scores.values()) {
       expect(score.source).toBe('KeywordLookup');
     }
