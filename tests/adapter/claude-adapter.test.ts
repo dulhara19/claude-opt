@@ -25,7 +25,14 @@ import {
   restoreClaudeMd,
   estimateTokens,
 } from '../../src/adapter/claude-adapter.js';
-import { FALLBACK_EXIT_CODE, CLAUDE_MD_BACKUP } from '../../src/adapter/types.js';
+import {
+  FALLBACK_EXIT_CODE,
+  CLAUDE_MD_BACKUP,
+  MODEL_ID_MAP,
+  DEFAULT_SUBPROCESS_TIMEOUT,
+  MAX_OUTPUT_SIZE,
+} from '../../src/adapter/types.js';
+import { resolveModelId } from '../../src/adapter/claude-adapter.js';
 import type { PipelineContext } from '../../src/types/index.js';
 import { TaskType, Complexity } from '../../src/types/index.js';
 
@@ -164,6 +171,66 @@ describe('generateClaudeMd', () => {
 
     expect(content).not.toContain('## Task Context');
   });
+
+  it('AD1: includes conventions from compression sections', () => {
+    const ctx = makeContext('/tmp/test');
+    ctx.compression = {
+      ...ctx.compression!,
+      sections: [
+        { type: 'userRequest', content: 'fix bug', source: 'test' },
+        { type: 'conventions', content: '- Use camelCase\n- Prefer const', source: 'patterns' },
+      ],
+    };
+    const content = generateClaudeMd(ctx);
+
+    expect(content).toContain('## Conventions');
+    expect(content).toContain('Use camelCase');
+    expect(content).toContain('Prefer const');
+  });
+
+  it('AD1: includes domain context from compression sections', () => {
+    const ctx = makeContext('/tmp/test');
+    ctx.compression = {
+      ...ctx.compression!,
+      sections: [
+        { type: 'userRequest', content: 'fix bug', source: 'test' },
+        { type: 'domainContext', content: '- auth: src/auth/login.ts (1.2KB)', source: 'domain' },
+      ],
+    };
+    const content = generateClaudeMd(ctx);
+
+    expect(content).toContain('## Domain Context');
+    expect(content).toContain('auth: src/auth/login.ts');
+  });
+
+  it('AD1: includes signal reasons for high-confidence files', () => {
+    const ctx = makeContext('/tmp/test');
+    ctx.prediction = {
+      ...ctx.prediction!,
+      predictions: [
+        { filePath: 'src/auth/login.ts', score: 0.9, signals: [{ signal: 'history', source: 'history-similarity', weight: 0.3, score: 0.9 }, { signal: 'graph', source: 'graph-traversal', weight: 0.2, score: 0.8 }] },
+      ],
+    };
+    const content = generateClaudeMd(ctx);
+
+    expect(content).toContain('history-similarity');
+  });
+
+  it('AD1: truncates CLAUDE.md when exceeding max length', () => {
+    const ctx = makeContext('/tmp/test');
+    // Create very long conventions
+    ctx.compression = {
+      ...ctx.compression!,
+      sections: [
+        { type: 'userRequest', content: 'fix bug', source: 'test' },
+        { type: 'conventions', content: 'x'.repeat(5000), source: 'test' },
+      ],
+    };
+    const content = generateClaudeMd(ctx);
+
+    expect(content.length).toBeLessThan(4200); // MAX_CLAUDEMD_LENGTH + truncation marker
+    expect(content).toContain('truncated');
+  });
 });
 
 describe('writeClaudeMd / restoreClaudeMd', () => {
@@ -221,19 +288,31 @@ describe('writeClaudeMd / restoreClaudeMd', () => {
 });
 
 describe('estimateTokens', () => {
-  it('estimates ~4 chars per token (AC2)', () => {
+  it('estimates tokens with content-type-aware multipliers and overhead (AC2)', () => {
+    // With no text provided, uses 'default' (4.0) for prompt and 'code' (3.5) for output
+    // plus 150 overhead tokens
     const estimate = estimateTokens(100, 400);
-    expect(estimate).toBe(125);
+    // prompt: ceil(100/4.0) = 25, output: ceil(400/3.5) = 115, overhead: 150 => 290
+    expect(estimate).toBe(25 + 115 + 150);
   });
 
   it('rounds up partial tokens', () => {
     const estimate = estimateTokens(10, 1);
-    expect(estimate).toBe(3);
+    // prompt: ceil(10/4.0) = 3, output: ceil(1/3.5) = 1, overhead: 150 => 154
+    expect(estimate).toBe(3 + 1 + 150);
   });
 
-  it('handles zero length', () => {
+  it('handles zero length (returns only overhead)', () => {
     const estimate = estimateTokens(0, 0);
-    expect(estimate).toBe(0);
+    // prompt: 0, output: 0, overhead: 150
+    expect(estimate).toBe(150);
+  });
+
+  it('uses content-type detection when text is provided', () => {
+    const codeText = 'function hello() { return 42; }';
+    const estimate = estimateTokens(codeText.length, 0, codeText);
+    // code multiplier is 3.5 for prompt, 0 output, plus 150 overhead
+    expect(estimate).toBe(Math.ceil(codeText.length / 3.5) + 0 + 150);
   });
 });
 
@@ -301,5 +380,102 @@ describe('executeTaskFailOpen — fail-open behavior (AC3)', () => {
 
     expect(result).toBeDefined();
     expect(result.isFallback).toBe(true);
+  });
+
+  it('AD13: includes errorReason on failure', async () => {
+    mockExecSync.mockImplementation(() => {
+      throw new Error('Claude Code CLI not found');
+    });
+
+    const ctx = makeContext(tempDir);
+    const result = await executeTaskFailOpen(ctx);
+
+    expect(result.errorReason).toBeDefined();
+    expect(result.isFallback).toBe(true);
+  });
+});
+
+// AD2: Model ID mapping
+describe('resolveModelId', () => {
+  it('AD2: maps tier names to full model IDs', () => {
+    expect(resolveModelId('haiku')).toBe('claude-haiku-4-5-20251001');
+    expect(resolveModelId('sonnet')).toBe('claude-sonnet-4-6');
+    expect(resolveModelId('opus')).toBe('claude-opus-4-6');
+  });
+
+  it('AD2: passes through unknown model IDs unchanged', () => {
+    expect(resolveModelId('claude-custom-model')).toBe('claude-custom-model');
+  });
+
+  it('AD2: prefers config.modelIds over built-in map', () => {
+    const config = { modelIds: { haiku: 'claude-haiku-custom' } };
+    expect(resolveModelId('haiku', config)).toBe('claude-haiku-custom');
+  });
+
+  it('AD2: falls back to built-in map when config has no override', () => {
+    const config = { modelIds: {} };
+    expect(resolveModelId('sonnet', config)).toBe('claude-sonnet-4-6');
+  });
+});
+
+// AD3: Default subprocess timeout
+describe('DEFAULT_SUBPROCESS_TIMEOUT', () => {
+  it('AD3: is 5 minutes (300000ms)', () => {
+    expect(DEFAULT_SUBPROCESS_TIMEOUT).toBe(300_000);
+  });
+});
+
+// AD4: Output size cap
+describe('MAX_OUTPUT_SIZE', () => {
+  it('AD4: is 1MB (1048576 bytes)', () => {
+    expect(MAX_OUTPUT_SIZE).toBe(1_048_576);
+  });
+});
+
+// AD5: Crash recovery
+describe('AD5: stale backup recovery', () => {
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+  afterEach(() => {
+    cleanup(tempDir);
+  });
+
+  it('restores stale backup from interrupted run on next write', () => {
+    // Simulate interrupted run: backup exists with original content
+    fs.writeFileSync(path.join(tempDir, CLAUDE_MD_BACKUP), '# Real Original');
+    fs.writeFileSync(path.join(tempDir, 'CLAUDE.md'), '# Stale Optimized');
+
+    // restoreClaudeMd should fix this
+    restoreClaudeMd(tempDir);
+
+    expect(fs.readFileSync(path.join(tempDir, 'CLAUDE.md'), 'utf-8')).toBe('# Real Original');
+    expect(fs.existsSync(path.join(tempDir, CLAUDE_MD_BACKUP))).toBe(false);
+  });
+});
+
+// AD7: Token estimate with CLAUDE.md
+describe('estimateTokens with injected content', () => {
+  it('AD7: includes injected content length in estimate', () => {
+    const baseEstimate = estimateTokens(100, 400);
+    const withInjection = estimateTokens(100, 400, undefined, undefined, 500);
+    // Injected: ceil(500/4.5) = 112 extra tokens
+    expect(withInjection).toBeGreaterThan(baseEstimate);
+    expect(withInjection - baseEstimate).toBe(Math.ceil(500 / 4.5));
+  });
+
+  it('AD7: zero injected content adds no extra tokens', () => {
+    const base = estimateTokens(100, 400);
+    const withZero = estimateTokens(100, 400, undefined, undefined, 0);
+    expect(withZero).toBe(base);
+  });
+});
+
+// AD2: MODEL_ID_MAP
+describe('MODEL_ID_MAP', () => {
+  it('AD2: contains all three tiers', () => {
+    expect(MODEL_ID_MAP).toHaveProperty('haiku');
+    expect(MODEL_ID_MAP).toHaveProperty('sonnet');
+    expect(MODEL_ID_MAP).toHaveProperty('opus');
   });
 });
