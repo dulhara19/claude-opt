@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import {
   compressPrompt,
   removeFiller,
@@ -9,14 +9,8 @@ import {
   DEFAULT_COMPRESSION,
 } from '../../src/compressor/prompt-compressor.js';
 import type { PromptSection } from '../../src/compressor/types.js';
-import type { PipelineContext } from '../../src/types/index.js';
+import type { PipelineContext, StoreCache } from '../../src/types/index.js';
 import { TaskType, Complexity } from '../../src/types/index.js';
-import { createTempProjectRoot, cleanupTempProjectRoot } from '../helpers/test-store.js';
-import {
-  initializeStore,
-  writePatterns,
-  writeProjectMap,
-} from '../../src/store/index.js';
 import {
   createDefaultPatterns,
   createDefaultProjectMap,
@@ -24,15 +18,16 @@ import {
 
 function makeContext(
   taskText: string,
-  workingDir: string,
+  storeCache?: StoreCache,
   overrides: Partial<PipelineContext> = {},
 ): PipelineContext {
   return {
     taskText,
-    workingDir,
+    workingDir: '/tmp/test',
     isDryRun: true,
     results: {},
     startedAt: Date.now(),
+    storeCache,
     ...overrides,
   };
 }
@@ -109,16 +104,19 @@ describe('buildFileContext', () => {
     expect(highIdx).toBeLessThan(lowIdx);
   });
 
-  it('limits injected files to max 10', () => {
-    const predictions = Array.from({ length: 15 }, (_, i) => ({
-      filePath: `src/file-${i}.ts`,
-      score: 0.9 - i * 0.05,
+  it('limits injected files by token budget', () => {
+    // Create 100 files — total tokens will exceed the 2000-token budget
+    const predictions = Array.from({ length: 100 }, (_, i) => ({
+      filePath: `src/modules/feature-area-${i}/components/implementation-detail-${i}/very-long-component-name-${i}.tsx`,
+      score: 0.9 - i * 0.005,
       signals: [],
     }));
     const result = buildFileContext(predictions);
     expect(result).not.toBeNull();
     const lines = result!.content.split('\n');
-    expect(lines.length).toBeLessThanOrEqual(10);
+    // Token budget should cut off before all 100 files are included
+    expect(lines.length).toBeLessThan(100);
+    expect(lines.length).toBeGreaterThan(0);
   });
 
   it('includes confidence score in output', () => {
@@ -250,19 +248,8 @@ describe('assemblePrompt', () => {
 });
 
 describe('compressPrompt', () => {
-  let projectRoot: string;
-
-  beforeEach(() => {
-    projectRoot = createTempProjectRoot();
-    initializeStore(projectRoot);
-  });
-
-  afterEach(() => {
-    cleanupTempProjectRoot(projectRoot);
-  });
-
   it('returns a complete CompressionResult', () => {
-    const ctx = makeContext('Please fix the auth bug', projectRoot);
+    const ctx = makeContext('Please fix the auth bug');
     const result = compressPrompt(ctx);
 
     expect(result).toHaveProperty('optimizedPrompt');
@@ -275,7 +262,7 @@ describe('compressPrompt', () => {
   });
 
   it('removes filler words and records stats', () => {
-    const ctx = makeContext('Can you please just fix the authentication bug', projectRoot);
+    const ctx = makeContext('Can you please just fix the authentication bug');
     const result = compressPrompt(ctx);
 
     expect(result.optimizedPrompt).not.toMatch(/\bplease\b/i);
@@ -285,7 +272,7 @@ describe('compressPrompt', () => {
   });
 
   it('injects predicted file context when predictions exist', () => {
-    const ctx = makeContext('fix the bug', projectRoot, {
+    const ctx = makeContext('fix the bug', undefined, {
       prediction: {
         predictions: [
           { filePath: 'src/auth.ts', score: 0.92, signals: [] },
@@ -304,14 +291,13 @@ describe('compressPrompt', () => {
     expect(result.stats.filesInjected).toBe(2);
   });
 
-  it('injects conventions when patterns exist in store', () => {
+  it('injects conventions when patterns exist in store cache', () => {
     const patterns = createDefaultPatterns();
     patterns.conventions = [
       { pattern: '.test.ts', description: 'Test files use .test.ts suffix', examples: [] },
     ];
-    writePatterns(projectRoot, patterns);
 
-    const ctx = makeContext('add tests for auth', projectRoot);
+    const ctx = makeContext('add tests for auth', { patterns });
     const result = compressPrompt(ctx);
 
     expect(result.optimizedPrompt).toContain('## Project Conventions');
@@ -334,9 +320,8 @@ describe('compressPrompt', () => {
         keywords: ['auth'],
       },
     };
-    writeProjectMap(projectRoot, projectMap);
 
-    const ctx = makeContext('fix auth bug', projectRoot, {
+    const ctx = makeContext('fix auth bug', { projectMap }, {
       classification: {
         type: TaskType.BugFix,
         domain: 'auth',
@@ -351,7 +336,7 @@ describe('compressPrompt', () => {
   });
 
   it('records compression ratio in stats', () => {
-    const ctx = makeContext('Can you please basically just actually fix the simple bug', projectRoot);
+    const ctx = makeContext('Can you please basically just actually fix the simple bug');
     const result = compressPrompt(ctx);
 
     expect(result.stats.compressionRatio).toBeGreaterThan(0);
@@ -360,7 +345,7 @@ describe('compressPrompt', () => {
   });
 
   it('completes compression in under 100ms', () => {
-    const ctx = makeContext('Fix the authentication module error handling', projectRoot, {
+    const ctx = makeContext('Fix the authentication module error handling', undefined, {
       prediction: {
         predictions: [
           { filePath: 'src/auth.ts', score: 0.9, signals: [] },
@@ -382,7 +367,7 @@ describe('compressPrompt', () => {
   });
 
   it('works with no prediction or classification (minimal context)', () => {
-    const ctx = makeContext('fix the bug', projectRoot);
+    const ctx = makeContext('fix the bug');
     const result = compressPrompt(ctx);
 
     expect(result.optimizedPrompt).toContain('## Task');
@@ -407,7 +392,7 @@ describe('DEFAULT_COMPRESSION', () => {
 
 describe('fail-open behavior', () => {
   it('original prompt preserved when compressor receives no store data', () => {
-    const ctx = makeContext('fix the simple bug', '/nonexistent/path');
+    const ctx = makeContext('fix the simple bug');
     const result = compressPrompt(ctx);
 
     // Even without store data, the user request section is always present

@@ -72,7 +72,8 @@ describe('runPipeline', () => {
     expect(ctx.classification).toBeDefined();
     expect(ctx.classification!.type).toBe(TaskType.Unknown);
     expect(ctx.classification!.domain).toBe('general');
-    expect(ctx.classification!.complexity).toBe(Complexity.Medium);
+    // Short unknown prompts classify as Low due to prompt-length signal
+    expect(ctx.classification!.complexity).toBe(Complexity.Low);
   });
 
   it('completes pipeline in reasonable time', async () => {
