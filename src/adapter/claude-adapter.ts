@@ -4,7 +4,13 @@ import path from 'node:path';
 import type { PipelineContext, Result } from '../types/index.js';
 import { ok, err, logger } from '../utils/index.js';
 import type { AdapterResult, SpawnOptions, ClaudeCodeInfo } from './types.js';
-import { FALLBACK_EXIT_CODE, CLAUDE_MD_BACKUP } from './types.js';
+import {
+  FALLBACK_EXIT_CODE,
+  CLAUDE_MD_BACKUP,
+  MODEL_ID_MAP,
+  DEFAULT_SUBPROCESS_TIMEOUT,
+  MAX_OUTPUT_SIZE,
+} from './types.js';
 import { captureTimestamps, detectFilesUsed } from './file-detector.js';
 
 const MODULE = 'adapter';
@@ -49,19 +55,31 @@ export function resetClaudeCodeCache(): void {
   cachedClaudeCode = null;
 }
 
+/** AD1: Max total length for CLAUDE.md content to avoid bloating. */
+const MAX_CLAUDEMD_LENGTH = 4000;
+
 /**
- * Generate an optimized CLAUDE.md content from pipeline context.
+ * AD1: Generate an optimized CLAUDE.md content from pipeline context.
+ * Includes focus files with signal reasons, conventions, and domain context.
  */
 export function generateClaudeMd(ctx: PipelineContext): string {
   const lines: string[] = ['# Claude Optimizer Context', ''];
 
-  // Focus Files from prediction
+  // Focus Files from prediction — AD1: include signal reasons for high-confidence
   if (ctx.prediction && ctx.prediction.predictions.length > 0) {
     lines.push('## Focus Files');
     lines.push('The following files are predicted to be relevant to this task:');
     for (const pred of ctx.prediction.predictions) {
       const confidence = pred.score >= 0.8 ? 'high' : pred.score >= 0.5 ? 'medium' : 'low';
-      lines.push(`- ${pred.filePath} (${confidence} confidence)`);
+      let line = `- ${pred.filePath} (${confidence} confidence)`;
+      // AD1: Add top signal reasons for high-confidence files
+      if (pred.score >= 0.8 && pred.signals && pred.signals.length > 0) {
+        const reasons = pred.signals.slice(0, 2).map(s => s.source ?? s.signal ?? String(s)).join(', ');
+        if (reasons) {
+          line += ` — ${reasons}`;
+        }
+      }
+      lines.push(line);
     }
     lines.push('');
   }
@@ -75,7 +93,49 @@ export function generateClaudeMd(ctx: PipelineContext): string {
     lines.push('');
   }
 
-  return lines.join('\n');
+  // AD1: Conventions from compression sections
+  if (ctx.compression?.sections) {
+    const conventions = ctx.compression.sections.find(s => s.type === 'conventions');
+    if (conventions && conventions.content.trim()) {
+      lines.push('## Conventions');
+      const convLines = conventions.content.trim().split('\n').slice(0, 10);
+      lines.push(...convLines);
+      lines.push('');
+    }
+  }
+
+  // AD1: Domain context from compression sections
+  if (ctx.compression?.sections) {
+    const domainCtx = ctx.compression.sections.find(s => s.type === 'domainContext');
+    if (domainCtx && domainCtx.content.trim()) {
+      lines.push('## Domain Context');
+      const domainLines = domainCtx.content.trim().split('\n').slice(0, 10);
+      lines.push(...domainLines);
+      lines.push('');
+    }
+  }
+
+  let content = lines.join('\n');
+
+  // AD1: Cap total length to avoid bloating
+  if (content.length > MAX_CLAUDEMD_LENGTH) {
+    content = content.slice(0, MAX_CLAUDEMD_LENGTH) + '\n\n<!-- truncated -->\n';
+  }
+
+  return content;
+}
+
+/**
+ * AD2: Resolve model tier name to full Claude model ID.
+ * Falls back to tier name if no mapping exists (forward-compatible).
+ */
+export function resolveModelId(tierOrId: string, config?: { modelIds?: Record<string, string> }): string {
+  // Check user config first
+  if (config?.modelIds?.[tierOrId]) {
+    return config.modelIds[tierOrId];
+  }
+  // Fall back to built-in map
+  return MODEL_ID_MAP[tierOrId] ?? tierOrId;
 }
 
 /**
@@ -120,23 +180,90 @@ export function restoreClaudeMd(projectRoot: string): void {
 }
 
 /**
- * Estimate tokens consumed from output text.
- * Uses ~4 characters per token heuristic.
+ * AD5: Recover from a previous interrupted run.
+ * If a stale backup exists, restore it before proceeding.
  */
-export function estimateTokens(promptLength: number, outputLength: number): number {
-  return Math.ceil((promptLength + outputLength) / 4);
+function recoverStaleBackup(projectRoot: string): void {
+  const backupPath = path.join(projectRoot, CLAUDE_MD_BACKUP);
+  if (fs.existsSync(backupPath)) {
+    logger.warn(MODULE, 'Detected stale CLAUDE.md backup from interrupted run — restoring');
+    restoreClaudeMd(projectRoot);
+  }
+}
+
+/** Per-content-type token multipliers (chars per token). */
+const TOKEN_MULTIPLIERS: Record<string, number> = {
+  code: 3.5,
+  markdown: 4.5,
+  config: 3.0,
+  default: 4.0,
+};
+
+/** Fixed overhead tokens for injection context (CLAUDE.md, system prompt). */
+const INJECTION_OVERHEAD_TOKENS = 150;
+
+/**
+ * Detect content type heuristically from text.
+ */
+function detectContentType(text: string): 'code' | 'markdown' | 'config' | 'default' {
+  const sample = text.slice(0, 500);
+  if (/^[{[\s]*"/.test(sample) || /^\w+\s*[:=]/.test(sample)) return 'config';
+  if (/^#{1,6}\s|^\*\*|^\-\s/.test(sample)) return 'markdown';
+  if (/(?:function|class|import|export|const|let|var|def|if|for|while)\s/.test(sample)) return 'code';
+  return 'default';
 }
 
 /**
- * Spawn Claude Code as a subprocess and capture output.
+ * AD7: Estimate tokens consumed from prompt and output text.
+ * Uses content-type-aware multipliers for better accuracy.
+ * Optionally includes injected content (CLAUDE.md) in the estimate.
+ */
+export function estimateTokens(
+  promptLength: number,
+  outputLength: number,
+  promptText?: string,
+  outputText?: string,
+  injectedContentLength = 0,
+): number {
+  const promptType = promptText ? detectContentType(promptText) : 'default';
+  const outputType = outputText ? detectContentType(outputText) : 'code';
+
+  const promptTokens = Math.ceil(promptLength / TOKEN_MULTIPLIERS[promptType]);
+  const outputTokens = Math.ceil(outputLength / TOKEN_MULTIPLIERS[outputType]);
+  const injectedTokens = Math.ceil(injectedContentLength / TOKEN_MULTIPLIERS.markdown);
+
+  return promptTokens + outputTokens + injectedTokens + INJECTION_OVERHEAD_TOKENS;
+}
+
+/**
+ * AD13: Categorize an error into a reason string.
+ */
+function categorizeError(error: unknown): AdapterResult['errorReason'] {
+  if (!(error instanceof Error)) return 'unknown';
+  const msg = error.message.toLowerCase();
+  if (msg.includes('timed out') || msg.includes('timeout')) return 'timeout';
+  if (msg.includes('not found') || msg.includes('cli not found')) return 'cli_not_found';
+  if (msg.includes('rate limit') || msg.includes('429')) return 'rate_limit';
+  if (msg.includes('spawn') || msg.includes('exited with code') || msg.includes('subprocess')) return 'subprocess_error';
+  return 'unknown';
+}
+
+/**
+ * AD3+AD4: Spawn Claude Code as a subprocess and capture output.
+ * Applies default timeout and output size cap.
  */
 export function spawnClaudeCode(options: SpawnOptions): Promise<AdapterResult> {
   const startTime = performance.now();
   const args = ['-p', options.prompt];
 
+  // AD2: Resolve model tier to full model ID
   if (options.model) {
-    args.push('--model', options.model);
+    const resolvedModel = resolveModelId(options.model);
+    args.push('--model', resolvedModel);
   }
+
+  // AD3: Apply default timeout if none specified
+  const timeout = options.timeout ?? DEFAULT_SUBPROCESS_TIMEOUT;
 
   return new Promise<AdapterResult>((resolve, reject) => {
     const child = spawn('claude', args, {
@@ -147,9 +274,19 @@ export function spawnClaudeCode(options: SpawnOptions): Promise<AdapterResult> {
 
     let stdout = '';
     let stderr = '';
+    let truncated = false;
 
     child.stdout.on('data', (data: Buffer) => {
-      stdout += data.toString();
+      // AD4: Cap output size
+      if (truncated) return;
+      const chunk = data.toString();
+      if (stdout.length + chunk.length > MAX_OUTPUT_SIZE) {
+        stdout += chunk.slice(0, MAX_OUTPUT_SIZE - stdout.length);
+        truncated = true;
+        logger.warn(MODULE, `Output size exceeded ${MAX_OUTPUT_SIZE} bytes — truncating`);
+      } else {
+        stdout += chunk;
+      }
     });
 
     child.stderr.on('data', (data: Buffer) => {
@@ -157,25 +294,22 @@ export function spawnClaudeCode(options: SpawnOptions): Promise<AdapterResult> {
     });
 
     let timedOut = false;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    if (options.timeout) {
-      timer = setTimeout(() => {
-        timedOut = true;
-        child.kill('SIGTERM');
-      }, options.timeout);
-    }
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill('SIGTERM');
+    }, timeout);
 
     child.on('error', (error) => {
-      if (timer) clearTimeout(timer);
+      clearTimeout(timer);
       reject(error);
     });
 
     child.on('close', (code) => {
-      if (timer) clearTimeout(timer);
+      clearTimeout(timer);
       const durationMs = performance.now() - startTime;
 
       if (timedOut) {
-        reject(new Error(`Claude Code subprocess timed out after ${options.timeout}ms`));
+        reject(new Error(`Claude Code subprocess timed out after ${timeout}ms`));
         return;
       }
 
@@ -187,9 +321,10 @@ export function spawnClaudeCode(options: SpawnOptions): Promise<AdapterResult> {
         output: stdout,
         filesUsed: [], // Populated later by file detection
         exitCode: code ?? 1,
-        tokenEstimate: estimateTokens(options.prompt.length, stdout.length),
+        tokenEstimate: estimateTokens(options.prompt.length, stdout.length, options.prompt, stdout),
         isFallback: false,
         durationMs,
+        truncated: truncated || undefined,
       });
     });
   });
@@ -201,6 +336,9 @@ export function spawnClaudeCode(options: SpawnOptions): Promise<AdapterResult> {
  */
 export async function executeTask(ctx: PipelineContext): Promise<AdapterResult> {
   const projectRoot = ctx.workingDir;
+
+  // AD5: Recover from any previous interrupted run
+  recoverStaleBackup(projectRoot);
 
   // Step 1: Detect Claude Code CLI
   const cliResult = detectClaudeCode();
@@ -233,10 +371,20 @@ export async function executeTask(ctx: PipelineContext): Promise<AdapterResult> 
     // Step 7: Detect files used (timestamps + stdout parsing)
     const filesUsed = detectFilesUsed(beforeTimestamps, result.output, projectRoot);
 
+    // AD7: Re-estimate tokens including CLAUDE.md content
+    const tokenEstimate = estimateTokens(
+      prompt.length,
+      result.output.length,
+      prompt,
+      result.output,
+      claudeMdContent.length,
+    );
+
     // Step 8: Return complete AdapterResult
     return {
       ...result,
       filesUsed,
+      tokenEstimate,
     };
   } catch (error) {
     // Always restore CLAUDE.md, even on failure
@@ -246,8 +394,8 @@ export async function executeTask(ctx: PipelineContext): Promise<AdapterResult> 
 }
 
 /**
- * Execute raw Claude Code without optimization (fallback mode).
- * No CLAUDE.md injection, no model override.
+ * AD8: Execute raw Claude Code without optimization (fallback mode).
+ * No CLAUDE.md injection, no model override. Preserves real exit code.
  */
 export async function executeRaw(prompt: string, projectRoot: string): Promise<AdapterResult> {
   const startTime = performance.now();
@@ -265,23 +413,57 @@ export async function executeRaw(prompt: string, projectRoot: string): Promise<A
     ...result,
     filesUsed,
     isFallback: true,
-    exitCode: FALLBACK_EXIT_CODE,
+    // AD8: Keep real exit code from subprocess (don't override with FALLBACK_EXIT_CODE)
     durationMs,
   };
 }
 
+/** AD6: Delay in ms before retrying a transient failure. */
+const RETRY_DELAY_MS = 2000;
+
+/** AD6: Patterns indicating a transient/retriable error. */
+const RETRIABLE_PATTERNS = [
+  'timed out', 'timeout', 'rate limit', '429', '500', '503',
+  'econnreset', 'econnrefused', 'epipe', 'network',
+];
+
 /**
- * Execute task with fail-open behavior.
- * If optimized execution fails, falls back to raw execution.
- * If raw also fails, returns an error AdapterResult (never throws).
+ * AD6: Check if an error is retriable (transient).
+ */
+function isRetriableError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const msg = error.message.toLowerCase();
+  return RETRIABLE_PATTERNS.some(p => msg.includes(p));
+}
+
+/**
+ * AD6+AD13: Execute task with fail-open behavior.
+ * If optimized execution fails with a transient error, retries once after delay.
+ * Then falls back to raw execution.
+ * If raw also fails, returns an error AdapterResult with errorReason (never throws).
  */
 export async function executeTaskFailOpen(ctx: PipelineContext): Promise<AdapterResult> {
   try {
     return await executeTask(ctx);
   } catch (error) {
-    logger.error(MODULE, 'Optimized execution failed, falling back to raw', error);
+    const errorReason = categorizeError(error);
+
+    // AD6: Retry once on transient failures
+    if (isRetriableError(error)) {
+      logger.warn(MODULE, `Transient error (${errorReason}), retrying in ${RETRY_DELAY_MS}ms...`);
+      await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS));
+      try {
+        return await executeTask(ctx);
+      } catch (retryError) {
+        logger.error(MODULE, 'Retry also failed, falling back to raw', retryError);
+      }
+    } else {
+      logger.error(MODULE, 'Optimized execution failed, falling back to raw', error);
+    }
+
     try {
-      return await executeRaw(ctx.taskText, ctx.workingDir);
+      const rawResult = await executeRaw(ctx.taskText, ctx.workingDir);
+      return { ...rawResult, errorReason };
     } catch (rawError) {
       logger.error(MODULE, 'Raw execution also failed', rawError);
       return {
@@ -291,6 +473,7 @@ export async function executeTaskFailOpen(ctx: PipelineContext): Promise<Adapter
         tokenEstimate: 0,
         isFallback: true,
         durationMs: 0,
+        errorReason: categorizeError(rawError),
       };
     }
   }

@@ -14,6 +14,10 @@ export interface AdapterResult {
   isFallback: boolean;
   /** Total execution duration in milliseconds */
   durationMs: number;
+  /** AD4: Whether output was truncated due to size cap */
+  truncated?: boolean;
+  /** AD13: Categorized error reason when execution fails */
+  errorReason?: 'timeout' | 'cli_not_found' | 'rate_limit' | 'subprocess_error' | 'unknown';
 }
 
 /**
@@ -59,3 +63,19 @@ export const FALLBACK_EXIT_CODE = 10;
 
 /** Backup filename for original CLAUDE.md */
 export const CLAUDE_MD_BACKUP = '.claude-opt-backup-CLAUDE.md';
+
+/** AD2: Model tier → full model ID mapping. */
+export const MODEL_ID_MAP: Record<string, string> = {
+  haiku: 'claude-haiku-4-5-20251001',
+  sonnet: 'claude-sonnet-4-6',
+  opus: 'claude-opus-4-6',
+};
+
+/** AD3: Default subprocess timeout in ms (5 minutes). */
+export const DEFAULT_SUBPROCESS_TIMEOUT = 300_000;
+
+/** AD4: Maximum output size in bytes (1MB). */
+export const MAX_OUTPUT_SIZE = 1_048_576;
+
+/** AD12: Timestamp tolerance in ms for low-resolution filesystems. */
+export const TIMESTAMP_TOLERANCE_MS = 2000;
